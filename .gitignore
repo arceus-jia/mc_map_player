@@ -1,0 +1,7 @@
+__pycache__/
+.DS_Store
+.git
+.vscode
+output/
+input/
+map-frame-player/target
