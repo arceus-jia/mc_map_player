@@ -126,7 +126,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         return true;
                     }
                     String folder = a[1];
-                    int tpf = (a.length >= 3) ? Integer.parseInt(a[2]) : 1; 
+                    int tpf = (a.length >= 3) ? Integer.parseInt(a[2]) : 1;
                     boolean loop = (a.length >= 4) ? Boolean.parseBoolean(a[3]) : false; // 默认 false
                     int bufN = (a.length >= 5) ? Integer.parseInt(a[4]) : 0; // 默认 0
 
@@ -353,19 +353,22 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         void startPlayback(int tpf, boolean loop, int bufferTarget) {
             if (group == null || frames.isEmpty())
                 return;
-            if (ticksPerFrame < 0) {
-                this.ticksPerFrame = -1; // 特殊标记
-            } else {
-                this.ticksPerFrame = Math.max(1, ticksPerFrame);
-            }
+
+            // ✅ 用传进来的 tpf，而不是成员变量
+            this.ticksPerFrame = (tpf < 0) ? -1 : Math.max(1, tpf);
             this.loop = loop;
             this.bufferTarget = Math.max(0, bufferTarget);
+
             this.startTick = TICK;
-            this.nextFrameTick = startTick + this.ticksPerFrame;
+            // ✅ -1 表示不推进；给它一个不会命中的“远未来”
+            this.nextFrameTick = (this.ticksPerFrame == -1) ? Long.MAX_VALUE : (startTick + this.ticksPerFrame);
+
             this.buffer.clear();
             startPreloaderAsync();
-            dbg("startPlayback frames=" + frames.size() + " tpf=" + this.ticksPerFrame
-                    + " loop=" + this.loop + " bufferTarget=" + this.bufferTarget);
+            dbg("startPlayback frames=" + frames.size()
+                    + " tpf=" + this.ticksPerFrame
+                    + " loop=" + this.loop
+                    + " bufferTarget=" + this.bufferTarget);
         }
 
         void stopPlayback() {
@@ -431,7 +434,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                             for (int c = 0; c < group.cols; c++) {
                                 int dstIdx = r * group.cols + c;
                                 Binding b = group.members.get(dstIdx);
-                                byte[] tile = sliceTile(linear, w, group.cols, r, c, true);
+                                byte[] tile = sliceTile(linear, w, r, c, false);
                                 b.renderer.setStagedEpoch(epoch);
                                 b.renderer.stageFrame(tile);
                                 b.hasPendingFrame = true;
@@ -483,7 +486,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                                 for (int c = 0; c < group.cols; c++) {
                                     int dstIdx = r * group.cols + c;
                                     Binding b = group.members.get(dstIdx);
-                                    byte[] tile = sliceTile(linear, w, group.cols, r, c, true);
+                                    byte[] tile = sliceTile(linear, w, r, c, false);
                                     b.renderer.setStagedEpoch(epoch);
                                     b.renderer.stageFrame(tile);
                                     b.hasPendingFrame = true;
@@ -565,15 +568,23 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             return true;
         }
 
-        private static byte[] sliceTile(byte[] src, int bigW, int cols, int tileRow, int tileCol, boolean flipX) {
+        private static byte[] sliceTile(byte[] src, int bigW, int tileRow, int tileCol, boolean flipX) {
             byte[] out = new byte[128 * 128];
-            // 如果 flipX=true，则从右往左切（把 0→(cols-1) 变成 (cols-1)→0）
-            int colIndex = flipX ? (cols - 1 - tileCol) : tileCol;
-            int srcX0 = colIndex * 128;
-            int srcY0 = tileRow * 128;
-            for (int y = 0; y < 128; y++) {
-                int srcOff = (srcY0 + y) * bigW + srcX0;
-                System.arraycopy(src, srcOff, out, y * 128, 128);
+            int srcX0 = tileCol * 128, srcY0 = tileRow * 128;
+            if (!flipX) {
+                for (int y = 0; y < 128; y++) {
+                    int srcOff = (srcY0 + y) * bigW + srcX0;
+                    System.arraycopy(src, srcOff, out, y * 128, 128);
+                }
+            } else {
+                // 仅在确实需要镜像时开启
+                for (int y = 0; y < 128; y++) {
+                    int srcOff = (srcY0 + y) * bigW + srcX0;
+                    int dstOff = y * 128;
+                    for (int x = 0; x < 128; x++) {
+                        out[dstOff + x] = src[srcOff + (127 - x)];
+                    }
+                }
             }
             return out;
         }
@@ -841,16 +852,17 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                 src = current;
             }
             if (sv == epoch)
-                return; // 玩家已是最新
+                return;
 
-            int idx = 0;
-            // 读取 current 时不持有锁，减少持锁时间
-            for (int x = 0; x < 128; x++) {
-                for (int z = 0; z < 128; z++) {
-                    canvas.setPixel(x, z, src[idx++]);
+            // ✅ 行优先：每行一个偏移，和 sliceTile 的写入完全一致
+            for (int y = 0; y < 128; y++) {
+                int rowOff = y * 128;
+                for (int x = 0; x < 128; x++) {
+                    canvas.setPixel(x, y, src[rowOff + x]);
                 }
             }
             seen.put(player.getUniqueId(), epoch);
         }
+
     }
 }
