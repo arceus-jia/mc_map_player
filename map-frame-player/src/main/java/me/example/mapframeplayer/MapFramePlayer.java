@@ -96,32 +96,60 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         try {
             switch (sub) {
                 case "create": {
-                    // /mplay create <cols> <rows> [radius]
+                    // /mplay create <cols> <rows> [radius] [x y z]
                     if (!(s instanceof Player)) {
                         s.sendMessage(color("&cThis command must be run by a player."));
                         return true;
                     }
-                    if (a.length < 3 || a.length > 4) {
-                        s.sendMessage(color("&f/mplay create <cols> <rows> [radius]"));
+                    if (a.length < 3 || a.length > 7) {
+                        s.sendMessage(color("&f/mplay create <cols> <rows> [radius] [x y z]"));
+                        s.sendMessage(color("&7radius默认0=不限；xyz是屏幕平面左下角的方块坐标（可选）。"));
                         return true;
                     }
+
                     Player ps = (Player) s;
                     int cols = Integer.parseInt(a[1]);
                     int rows = Integer.parseInt(a[2]);
-                    int radius = (a.length >= 4) ? Integer.parseInt(a[3]) : 0; // 0 = 不限距离
-                    if (cols <= 0 || rows <= 0) {
-                        s.sendMessage(color("&ccols/rows must > 0"));
+
+                    // 限制最大 16x9
+                    if (cols <= 0 || rows <= 0 || cols * rows > 16 * 9) {
+                        s.sendMessage(color("&cScreen too large. Max size is 16x9. You asked: " + cols + "x" + rows));
                         return true;
                     }
-                    boolean ok = binds.createAndBindFloatingAtPlayer(ps, cols, rows, radius, /* forward */2);
+
+                    int radius = 0;
+                    Location anchor = null;
+
+                    if (a.length == 4) {
+                        // 只有 radius
+                        radius = Integer.parseInt(a[3]);
+                    } else if (a.length == 6) {
+                        // 只有 xyz（radius=0）
+                        int x = Integer.parseInt(a[3]);
+                        int y = Integer.parseInt(a[4]);
+                        int z = Integer.parseInt(a[5]);
+                        anchor = new Location(ps.getWorld(), x, y, z);
+                    } else if (a.length == 7) {
+                        // radius + xyz
+                        radius = Integer.parseInt(a[3]);
+                        int x = Integer.parseInt(a[4]);
+                        int y = Integer.parseInt(a[5]);
+                        int z = Integer.parseInt(a[6]);
+                        anchor = new Location(ps.getWorld(), x, y, z);
+                    }
+
+                    boolean ok = binds.createAndBindFloatingAtPlayer(ps, cols, rows, radius, /* forward */2, anchor);
                     if (!ok) {
-                        s.sendMessage(color("&cCreate failed. Make sure there is space 2 blocks ahead."));
+                        s.sendMessage(color("&cCreate failed. Make sure there is free space."));
                     } else {
-                        s.sendMessage(color("&aCreated a " + cols + "x" + rows + " floating screen. radius=" + radius));
+                        s.sendMessage(color("&aCreated a " + cols + "x" + rows + " screen. radius=" + radius
+                                + (anchor != null
+                                        ? (" at " + anchor.getBlockX() + "," + anchor.getBlockY() + ","
+                                                + anchor.getBlockZ())
+                                        : " (in front of you)")));
                     }
                     return true;
                 }
-
                 case "set": {
                     // /mplay set <id1,id2,...> <world> <cols> <rows> [radius]
                     if (a.length < 5 || a.length > 6) {
@@ -233,7 +261,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         s.sendMessage(color(
                 "&7Frames: .json (HxW int), .smrf (raw W*H bytes), .png/.jpg (RGB via LUT), or a single video file (ffmpeg)."));
 
-        s.sendMessage(color("&f/mplay create <cols> <rows> [radius]"));
+        s.sendMessage(color("&f/mplay create <cols> <rows> [radius] [x y z]"));
         s.sendMessage(color("&f/mplay clear  &7— remove the last created screen (frames + barrier)"));
         s.sendMessage(color("&f/mplay reset  &7— stop playback and show a black screen"));
 
@@ -404,21 +432,24 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         }
 
         /** 在玩家面前 forward 格生成屏障墙 + 展示框 + 地图，并绑定，最后渲染纯黑初始画面 */
-        boolean createAndBindFloatingAtPlayer(Player p, int cols, int rows, int radius, int forward) {
+        boolean createAndBindFloatingAtPlayer(Player p, int cols, int rows, int radius, int forward, Location anchor) {
             World w = p.getWorld();
             BlockFace face = p.getFacing(); // 屏幕朝向玩家
             BlockFace right = rightOf(face); // 屏幕向右的方向
-            Block base = p.getLocation().getBlock().getRelative(face, Math.max(1, forward));
-            Block backingBase = base.getRelative(face);
 
-            // 1) 预检查空间是否足够（前方必须是空气，否则照放，但会覆盖为空气处为屏障）
-            // 2) 为每格：若背板是空气 -> 设为 BARRIER；否则保持原方块（可在现有墙上挂屏）
+            // 屏幕平面左下角：优先用 anchor；否则仍用“面前 forward 格”
+            Block base = (anchor != null && anchor.getWorld() == w)
+                    ? w.getBlockAt(anchor.getBlockX(), anchor.getBlockY(), anchor.getBlockZ())
+                    : p.getLocation().getBlock().getRelative(face, Math.max(1, forward));
+
+            Block backingBase = base.getRelative(face); // 屏幕后退一格作为背板列（BARRIER）
+
+            // 1) 屏障（只在空气处放），上->下、左->右
             List<Block> placedBarriers = new ArrayList<>();
             for (int r = 0; r < rows; r++) {
                 int yOff = (rows - 1 - r);
                 for (int c = 0; c < cols; c++) {
                     Block backing = backingBase.getRelative(right, c).getRelative(BlockFace.UP, yOff);
-
                     Material t = backing.getType();
                     if (t == Material.AIR || t == Material.CAVE_AIR || t == Material.VOID_AIR) {
                         backing.setType(Material.BARRIER, false);
@@ -427,15 +458,14 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                 }
             }
 
-            // 3) 为每格创建 MapView + ItemFrame 并放入地图
+            // 2) Map + ItemFrame（保持你原有朝向与顺序）
             int[] ids = new int[cols * rows];
             int idx = 0;
             List<ItemFrame> frames = new ArrayList<>();
             for (int r = 0; r < rows; r++) {
                 int yOff = (rows - 1 - r);
                 for (int c = 0; c < cols; c++) {
-                    Block backing = base.getRelative(right, c).getRelative(BlockFace.UP, yOff);
-
+                    Block backing = base.getRelative(right, c).getRelative(BlockFace.UP, yOff); // 注意：这里仍用 base（屏幕平面）
                     Location floc = backing.getLocation().add(0.5, 0.5, 0.5);
 
                     MapView view = Bukkit.createMap(w);
@@ -447,22 +477,20 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     }
 
                     ItemFrame frame = w.spawn(floc, ItemFrame.class, f -> {
-                        BlockFace attachFace = face.getOppositeFace();
+                        BlockFace attachFace = face.getOppositeFace(); // ← 保持你原版
                         f.setFacingDirection(attachFace, true);
-
                         f.setItem(mapItem, false);
                         f.setVisible(true);
                         try {
                             f.setFixed(true);
                         } catch (Throwable ignore) {
-                        } // 旧版本无此方法可忽略
+                        }
                     });
                     frames.add(frame);
 
                     try {
                         ids[idx++] = view.getId();
                     } catch (Throwable t) {
-                        // 回滚：删展示框 & 还原我们放的屏障
                         for (ItemFrame fr : frames)
                             try {
                                 fr.remove();
@@ -479,8 +507,14 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                 }
             }
 
-            // 4) 以玩家当前位置为屏幕中心绑定（让半径围绕屏幕）
-            Location center = p.getLocation();
+            // 3) 半径中心：改为“屏幕几何中心”，更准确
+            // 计算 right 的水平偏移量
+            int rx = right.getModX(), rz = right.getModZ();
+            double cx = base.getX() + 0.5 + rx * ((cols - 1) / 2.0);
+            double cy = base.getY() + 0.5 + ((rows - 1) / 2.0);
+            double cz = base.getZ() + 0.5 + rz * ((cols - 1) / 2.0);
+            Location center = new Location(w, cx, cy, cz);
+
             boolean bound = bind(ids, w.getName(), cols, rows, radius, center);
             if (!bound) {
                 for (ItemFrame fr : frames)
@@ -495,21 +529,19 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     }
                 return false;
             }
-            // bind 成功后
+
+            // 4) 记录清理用对象（/mplay clear）
             if (this.group != null) {
                 this.group.placedBarriers.clear();
                 for (Block b : placedBarriers)
                     this.group.placedBarriers.add(b.getLocation());
-            }
-            if (this.group != null) {
                 this.group.frameUUIDs.clear();
                 for (ItemFrame fr : frames)
                     this.group.frameUUIDs.add(fr.getUniqueId());
             }
 
-            // 5) 初始化为纯黑
+            // 5) 初始化黑屏
             initBlackFrame();
-
             return true;
         }
 
