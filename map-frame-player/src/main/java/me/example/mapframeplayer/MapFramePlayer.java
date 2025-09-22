@@ -203,6 +203,14 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         s.sendMessage(color("&cNo active screen to clear."));
                     return true;
                 }
+                case "reset": {
+                    boolean ok = binds.resetToBlack();
+                    if (ok)
+                        s.sendMessage(color("&aScreen reset to black."));
+                    else
+                        s.sendMessage(color("&cNo active binding to reset."));
+                    return true;
+                }
 
                 default:
                     help(s);
@@ -227,6 +235,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
 
         s.sendMessage(color("&f/mplay create <cols> <rows> [radius]"));
         s.sendMessage(color("&f/mplay clear  &7— remove the last created screen (frames + barrier)"));
+        s.sendMessage(color("&f/mplay reset  &7— stop playback and show a black screen"));
 
     }
 
@@ -897,6 +906,16 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             // 3) 解绑
             group.members.clear();
             group = null;
+            return true;
+        }
+
+        boolean resetToBlack() {
+            if (group == null)
+                return false;
+            // 停止任何播放/预加载，避免下一 tick 又把内容刷回来
+            stopPlayback();
+            // 立即发布一帧纯黑并发送给在范围内的玩家
+            initBlackFrame();
             return true;
         }
 

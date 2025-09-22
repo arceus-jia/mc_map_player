@@ -230,3 +230,8 @@ if __name__ == "__main__":
 
 # python extract_voice.py --input input/pokemon.mp4 --mcroot ~/Library/Application\ Support/minecraft/ --namespace pokemon
 # playsound minecraft:pokemon.default master @a
+
+# /time set day
+# /weather clear
+# /gamerule doDaylightCycle false
+# /gamerule doWeatherCycle false
