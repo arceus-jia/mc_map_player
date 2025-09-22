@@ -354,6 +354,14 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             if (group == null || frames.isEmpty())
                 return;
 
+            // 先把上次留下的 pending/staged 清干净（再次确保无残留）
+            for (Binding b : group.members) {
+                b.hasPendingFrame = false;
+                b.scheduledSendTick = -1L;
+                b.renderer.clearStagedOnly();
+                b.renderer.resetSeen();
+            }
+
             // ✅ 用传进来的 tpf，而不是成员变量
             this.ticksPerFrame = (tpf < 0) ? -1 : Math.max(1, tpf);
             this.loop = loop;
@@ -372,9 +380,27 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         }
 
         void stopPlayback() {
+            // 停止预加载线程 + 清空缓冲
+            stopPreloader();
+            buffer.clear();
+
+            // 清状态（不把屏幕抹黑，只清 pending / staged）
+            if (group != null) {
+                for (Binding b : group.members) {
+                    b.hasPendingFrame = false;
+                    b.scheduledSendTick = -1L;
+                    b.renderer.clearStagedOnly(); // ★ 切断残留 staged
+                    b.renderer.resetSeen(); // ★ 下一次发布时稳定重画
+                }
+            }
+
+            // 播放指针复位
             this.frames = Collections.emptyList();
             this.frameIndex = 0;
-            this.tSinceLast = 0;
+
+            // 让调度器不再推进
+            this.ticksPerFrame = 1; // 回到一个普通安全值
+            this.nextFrameTick = Long.MAX_VALUE;
         }
 
         void stop() {
@@ -840,6 +866,17 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             currentEpoch = stagedEpoch;
             hasStaged = false;
             seen.clear(); // 所有玩家需要重画
+        }
+
+        synchronized void clearStagedOnly() {
+            hasStaged = false;
+            stagedEpoch = 0L;
+            // staged 缓冲不必清零（可选），关键是切断 publish
+        }
+
+        // === 新增：清掉渲染器缓存的观测（避免重启后第一帧抖一下）===
+        synchronized void resetSeen() {
+            seen.clear();
         }
 
         @Override
