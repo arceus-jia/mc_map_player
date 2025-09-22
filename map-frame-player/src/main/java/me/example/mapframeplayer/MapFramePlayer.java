@@ -19,6 +19,16 @@ import java.awt.image.BufferedImage;
 
 import java.nio.file.Files;
 
+import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.MapMeta;
+import org.bukkit.entity.ItemFrame;
+import java.awt.Color;
+import java.util.stream.Collectors;
+
+import org.bukkit.entity.Entity;
+
 /**
  * 极简帧播放器：支持 JSON/SMRF/图片；当目录中只有 1 个视频文件时，自动用 ffmpeg 解码播放。
  * 命令：
@@ -85,6 +95,33 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         String sub = a[0].toLowerCase(Locale.ROOT);
         try {
             switch (sub) {
+                case "create": {
+                    // /mplay create <cols> <rows> [radius]
+                    if (!(s instanceof Player)) {
+                        s.sendMessage(color("&cThis command must be run by a player."));
+                        return true;
+                    }
+                    if (a.length < 3 || a.length > 4) {
+                        s.sendMessage(color("&f/mplay create <cols> <rows> [radius]"));
+                        return true;
+                    }
+                    Player ps = (Player) s;
+                    int cols = Integer.parseInt(a[1]);
+                    int rows = Integer.parseInt(a[2]);
+                    int radius = (a.length >= 4) ? Integer.parseInt(a[3]) : 0; // 0 = 不限距离
+                    if (cols <= 0 || rows <= 0) {
+                        s.sendMessage(color("&ccols/rows must > 0"));
+                        return true;
+                    }
+                    boolean ok = binds.createAndBindFloatingAtPlayer(ps, cols, rows, radius, /* forward */2);
+                    if (!ok) {
+                        s.sendMessage(color("&cCreate failed. Make sure there is space 2 blocks ahead."));
+                    } else {
+                        s.sendMessage(color("&aCreated a " + cols + "x" + rows + " floating screen. radius=" + radius));
+                    }
+                    return true;
+                }
+
                 case "set": {
                     // /mplay set <id1,id2,...> <world> <cols> <rows> [radius]
                     if (a.length < 5 || a.length > 6) {
@@ -110,7 +147,14 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         return true;
                     }
 
-                    boolean ok = binds.bind(ids, worldName, cols, rows, radius);
+                    Location center = null;
+                    if (s instanceof Player) {
+                        Player ps = (Player) s;
+                        if (ps.getWorld().getName().equals(worldName))
+                            center = ps.getLocation();
+                    }
+                    boolean ok = binds.bind(ids, worldName, cols, rows, radius, center);
+
                     if (!ok) {
                         s.sendMessage(color("&cBind failed. Check world and map ids."));
                     } else {
@@ -127,18 +171,19 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     }
                     String folder = a[1];
                     int tpf = (a.length >= 3) ? Integer.parseInt(a[2]) : 1;
-                    boolean loop = (a.length >= 4) ? Boolean.parseBoolean(a[3]) : false; // 默认 false
-                    int bufN = (a.length >= 5) ? Integer.parseInt(a[4]) : 0; // 默认 0
+                    boolean loop = (a.length >= 4) ? Boolean.parseBoolean(a[3]) : false;
+                    int warmup = (a.length >= 5) ? Integer.parseInt(a[4]) : 0; // 新：warmupTicks
 
                     int loaded = binds.loadFramesFromFolder(folder);
                     if (loaded <= 0) {
                         s.sendMessage(color("&cNo frames loaded. Check folder & size. " + folder));
                         return true;
                     }
-                    binds.startPlayback(tpf, loop, bufN);
+                    binds.startPlayback(tpf, loop, /* bufferTarget */ 0, /* warmupTicks */ warmup);
                     s.sendMessage(color("&aPlaying " + loaded + " frames at " + tpf + " tpf; loop=" + loop
-                            + (bufN > 0 ? (" buffer=" + bufN) : "")));
+                            + (warmup > 0 ? (" warmupTicks=" + warmup) : "")));
                     return true;
+
                 }
 
                 case "stop": {
@@ -150,6 +195,15 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     s.sendMessage(color("&f" + binds.statusString()));
                     return true;
                 }
+                case "clear": {
+                    boolean ok = binds.clearScreen();
+                    if (ok)
+                        s.sendMessage(color("&aCleared current screen and invisible backing."));
+                    else
+                        s.sendMessage(color("&cNo active screen to clear."));
+                    return true;
+                }
+
                 default:
                     help(s);
                     return true;
@@ -163,11 +217,17 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
     private void help(CommandSender s) {
         s.sendMessage(color("&eUsage:"));
         s.sendMessage(color("&f/mplay set <id1,id2,...> <world> <cols> <rows> [radius]"));
-        s.sendMessage(color("&f/mplay play <folder> <ticksPerFrame> [loop] [bufferFrames]"));
+        s.sendMessage(color("&f/mplay play <folder> <ticksPerFrame> [loop] [warmupTicks]"));
+        s.sendMessage(color("&7warmupTicks: 开播前延迟的 tick 数（20 tick = 1 秒）"));
+
         s.sendMessage(color("&f/mplay stop"));
         s.sendMessage(color("&f/mplay status"));
         s.sendMessage(color(
                 "&7Frames: .json (HxW int), .smrf (raw W*H bytes), .png/.jpg (RGB via LUT), or a single video file (ffmpeg)."));
+
+        s.sendMessage(color("&f/mplay create <cols> <rows> [radius]"));
+        s.sendMessage(color("&f/mplay clear  &7— remove the last created screen (frames + barrier)"));
+
     }
 
     private static String color(String s) {
@@ -209,6 +269,8 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         // —— 最大播放距离（<=0 表示无限制），取世界出生点为中心 ——
         private int maxDistance = 0;
 
+        private int warmupTicks = 0;
+
         void setLUT(byte[] lut) {
             this.lut = lut;
         }
@@ -235,27 +297,83 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             this.plugin = p;
         }
 
-        boolean bind(int[] mapIds, String worldName, int cols, int rows, int radius) {
+        /** 把当前绑定组初始化为纯黑画面（不等 tick，立刻发布并发送一次） */
+        private void initBlackFrame() {
+            if (group == null || group.members.isEmpty())
+                return;
+            int W = expectedWidth(), H = expectedHeight();
+            byte black = MapPalette.matchColor(Color.BLACK);
+
+            byte[] linear = new byte[W * H];
+            Arrays.fill(linear, black);
+
+            int bigW = group.cols * 128;
+            long epoch = ++group.epochCounter;
+
+            // stage tiles
+            for (int r = 0; r < group.rows; r++) {
+                for (int c = 0; c < group.cols; c++) {
+                    int idx = r * group.cols + c;
+                    Binding b = group.members.get(idx);
+                    byte[] tile = sliceTile(linear, bigW, r, c, false);
+                    b.renderer.setStagedEpoch(epoch);
+                    b.renderer.stageFrame(tile);
+                    b.hasPendingFrame = true;
+                }
+            }
+
+            // publish
+            List<MapView> views = new ArrayList<>(group.members.size());
+            group.members.stream().sorted(Comparator.comparingInt(x -> x.mapId)).forEach(b -> views.add(b.view));
+            for (Binding b : group.members)
+                b.renderer.publishIfStaged();
+
+            // send to in-range players
+            Map<World, List<Player>> online = new IdentityHashMap<>();
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                online.computeIfAbsent(p.getWorld(), wld -> new ArrayList<>()).add(p);
+            }
+            World wld = group.members.get(0).world;
+            List<Player> players = online.get(wld);
+            if (players != null) {
+                for (Player p : players) {
+                    Binding any = group.members.get(0);
+                    if (!this.inRange(p, any, group))
+                        continue;
+                    for (MapView v : views)
+                        p.sendMap(v);
+                }
+            }
+            for (Binding b : group.members)
+                b.hasPendingFrame = false;
+        }
+
+        // 如无注解依赖，可去掉 @Nullable
+        boolean bind(int[] mapIds, String worldName, int cols, int rows, int radius /* , @Nullable Location center */ ,
+                Location center) {
             World w = Bukkit.getWorld(worldName);
             if (w == null)
                 return false;
 
-            // 记录最大播放距离到一个字段（中心点用世界出生点）
+            // 记录半径
             this.maxDistance = radius;
 
-            // 构建组（替换旧组）
+            // 计算中心点（优先用传入的 center，其次用该世界的 spawn）
+            Location centerLoc = (center != null && center.getWorld() == w) ? center.clone() : w.getSpawnLocation();
+
+            // 构建组
             BindingGroup g = new BindingGroup(worldName, cols, rows, radius);
+            g.center = centerLoc; // ← 先把中心放进去
             g.members = new ArrayList<>(mapIds.length);
 
             int idx = 0;
-            for (int r = 0; r < rows; r++) {
-                for (int c = 0; c < cols; c++) {
+            for (int row = 0; row < rows; row++) {
+                for (int col = 0; col < cols; col++) {
                     int mapId = mapIds[idx++];
                     MapView view = Bukkit.getMap(mapId);
                     if (view == null)
                         return false;
 
-                    // 清理并挂上 DataRenderer
                     for (MapRenderer r0 : new ArrayList<>(view.getRenderers()))
                         view.removeRenderer(r0);
                     DataRenderer renderer = new DataRenderer();
@@ -264,13 +382,141 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     view.setUnlimitedTracking(false);
                     view.addRenderer(renderer);
 
+                    // 把范围信息灌进去（用已经确定的 centerLoc）
+                    renderer.setRange(w, centerLoc, this.maxDistance);
+
                     g.members.add(new Binding(mapId, w, view, renderer));
                 }
             }
-            g.center = w.getPlayers().isEmpty() ? w.getSpawnLocation() : w.getPlayers().get(0).getLocation();
-            // 替换
+
+            // 替换当前组
             this.group = g;
             return true;
+        }
+
+        /** 在玩家面前 forward 格生成屏障墙 + 展示框 + 地图，并绑定，最后渲染纯黑初始画面 */
+        boolean createAndBindFloatingAtPlayer(Player p, int cols, int rows, int radius, int forward) {
+            World w = p.getWorld();
+            BlockFace face = p.getFacing(); // 屏幕朝向玩家
+            BlockFace right = rightOf(face); // 屏幕向右的方向
+            Block base = p.getLocation().getBlock().getRelative(face, Math.max(1, forward));
+            Block backingBase = base.getRelative(face);
+
+            // 1) 预检查空间是否足够（前方必须是空气，否则照放，但会覆盖为空气处为屏障）
+            // 2) 为每格：若背板是空气 -> 设为 BARRIER；否则保持原方块（可在现有墙上挂屏）
+            List<Block> placedBarriers = new ArrayList<>();
+            for (int r = 0; r < rows; r++) {
+                int yOff = (rows - 1 - r);
+                for (int c = 0; c < cols; c++) {
+                    Block backing = backingBase.getRelative(right, c).getRelative(BlockFace.UP, yOff);
+
+                    Material t = backing.getType();
+                    if (t == Material.AIR || t == Material.CAVE_AIR || t == Material.VOID_AIR) {
+                        backing.setType(Material.BARRIER, false);
+                        placedBarriers.add(backing);
+                    }
+                }
+            }
+
+            // 3) 为每格创建 MapView + ItemFrame 并放入地图
+            int[] ids = new int[cols * rows];
+            int idx = 0;
+            List<ItemFrame> frames = new ArrayList<>();
+            for (int r = 0; r < rows; r++) {
+                int yOff = (rows - 1 - r);
+                for (int c = 0; c < cols; c++) {
+                    Block backing = base.getRelative(right, c).getRelative(BlockFace.UP, yOff);
+
+                    Location floc = backing.getLocation().add(0.5, 0.5, 0.5);
+
+                    MapView view = Bukkit.createMap(w);
+                    ItemStack mapItem = new ItemStack(Material.FILLED_MAP, 1);
+                    MapMeta meta = (MapMeta) mapItem.getItemMeta();
+                    if (meta != null) {
+                        meta.setMapView(view);
+                        mapItem.setItemMeta(meta);
+                    }
+
+                    ItemFrame frame = w.spawn(floc, ItemFrame.class, f -> {
+                        BlockFace attachFace = face.getOppositeFace();
+                        f.setFacingDirection(attachFace, true);
+
+                        f.setItem(mapItem, false);
+                        f.setVisible(true);
+                        try {
+                            f.setFixed(true);
+                        } catch (Throwable ignore) {
+                        } // 旧版本无此方法可忽略
+                    });
+                    frames.add(frame);
+
+                    try {
+                        ids[idx++] = view.getId();
+                    } catch (Throwable t) {
+                        // 回滚：删展示框 & 还原我们放的屏障
+                        for (ItemFrame fr : frames)
+                            try {
+                                fr.remove();
+                            } catch (Throwable ignore) {
+                            }
+                        for (Block b : placedBarriers)
+                            try {
+                                b.setType(Material.AIR, false);
+                            } catch (Throwable ignore) {
+                            }
+                        plugin.getLogger().warning("[mplay] failed to get map id: " + t.getMessage());
+                        return false;
+                    }
+                }
+            }
+
+            // 4) 以玩家当前位置为屏幕中心绑定（让半径围绕屏幕）
+            Location center = p.getLocation();
+            boolean bound = bind(ids, w.getName(), cols, rows, radius, center);
+            if (!bound) {
+                for (ItemFrame fr : frames)
+                    try {
+                        fr.remove();
+                    } catch (Throwable ignore) {
+                    }
+                for (Block b : placedBarriers)
+                    try {
+                        b.setType(Material.AIR, false);
+                    } catch (Throwable ignore) {
+                    }
+                return false;
+            }
+            // bind 成功后
+            if (this.group != null) {
+                this.group.placedBarriers.clear();
+                for (Block b : placedBarriers)
+                    this.group.placedBarriers.add(b.getLocation());
+            }
+            if (this.group != null) {
+                this.group.frameUUIDs.clear();
+                for (ItemFrame fr : frames)
+                    this.group.frameUUIDs.add(fr.getUniqueId());
+            }
+
+            // 5) 初始化为纯黑
+            initBlackFrame();
+
+            return true;
+        }
+
+        private static BlockFace rightOf(BlockFace face) {
+            switch (face) {
+                case NORTH:
+                    return BlockFace.EAST;
+                case SOUTH:
+                    return BlockFace.WEST;
+                case EAST:
+                    return BlockFace.SOUTH;
+                case WEST:
+                    return BlockFace.NORTH;
+                default:
+                    return BlockFace.EAST;
+            }
         }
 
         // 读取文件夹（.json/.smrf/.png/.jpg/.jpeg），或仅 1 个视频文件；按文件名排序，预检查尺寸匹配（图片/帧）
@@ -375,11 +621,11 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             return frames.size();
         }
 
-        void startPlayback(int tpf, boolean loop, int bufferTarget) {
+        void startPlayback(int tpf, boolean loop, int bufferTarget, int warmupTicks) {
             if (group == null)
                 return;
 
-            // 清 pending/staged，确保无残留
+            // 清 pending/staged（保持你原有代码）
             for (Binding b : group.members) {
                 b.hasPendingFrame = false;
                 b.scheduledSendTick = -1L;
@@ -387,13 +633,20 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                 b.renderer.resetSeen();
             }
 
-            // ✅ 用传进来的 tpf（允许 -1 定格）
             this.ticksPerFrame = (tpf < 0) ? -1 : Math.max(1, tpf);
             this.loop = loop;
-            this.bufferTarget = Math.max(0, bufferTarget);
+
+            // 旧的“攒 N 帧再开播”策略禁用：直接归零（也可保留为你想要的最小缓存）
+            this.bufferTarget = 0;
+
+            // 新增：预热 tick（可控起播延迟）
+            this.warmupTicks = Math.max(0, warmupTicks);
 
             this.startTick = TICK;
-            this.nextFrameTick = (this.ticksPerFrame == -1) ? Long.MAX_VALUE : (startTick + this.ticksPerFrame);
+            // 注意：首帧推进点 = start + warmup + tpf
+            this.nextFrameTick = (this.ticksPerFrame == -1)
+                    ? Long.MAX_VALUE
+                    : (startTick + this.warmupTicks + this.ticksPerFrame);
 
             this.buffer.clear();
             startPreloaderAsync();
@@ -401,7 +654,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     + " video=" + videoMode
                     + " tpf=" + this.ticksPerFrame
                     + " loop=" + this.loop
-                    + " bufferTarget=" + this.bufferTarget);
+                    + " warmupTicks=" + this.warmupTicks);
         }
 
         void stopPlayback() {
@@ -460,6 +713,9 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
 
                 // 没有帧且非视频模式就不做任何事
                 if (!videoMode && frames.isEmpty())
+                    return;
+
+                if (TICK < (startTick + warmupTicks))
                     return;
 
                 // ===== 模式A：tpf = -1 -> 只显示第一帧，不推进 =====
@@ -603,6 +859,45 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     }
                 }
             }, 1L, 1L);
+        }
+
+        boolean clearScreen() {
+            // 停播放，先不把 group 置空，方便读信息
+            stopPlayback();
+            if (group == null)
+                return false;
+
+            // 1) 移除 ItemFrame（不掉落地图）
+            World w = Bukkit.getWorld(group.worldName);
+            if (w != null) {
+                for (UUID id : new ArrayList<>(group.frameUUIDs)) {
+                    Entity e = Bukkit.getEntity(id);
+                    if (e instanceof ItemFrame) {
+                        ItemFrame f = (ItemFrame) e;
+                        try {
+                            f.setItem(null, false);
+                        } catch (Throwable ignore) {
+                            f.setItem(null);
+                        }
+                        f.remove();
+                    }
+                }
+            }
+            group.frameUUIDs.clear();
+
+            // 2) 恢复我们放的屏障
+            for (Location loc : new ArrayList<>(group.placedBarriers)) {
+                Block b = loc.getBlock();
+                if (b.getType() == Material.BARRIER) {
+                    b.setType(Material.AIR, false);
+                }
+            }
+            group.placedBarriers.clear();
+
+            // 3) 解绑
+            group.members.clear();
+            group = null;
+            return true;
         }
 
         private static boolean hasAnyPending(BindingGroup g) {
@@ -957,6 +1252,8 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         List<Binding> members = new ArrayList<>();
         long epochCounter = 0L;
         Location center;
+        List<Location> placedBarriers = new ArrayList<>();
+        List<UUID> frameUUIDs = new ArrayList<>();
 
         BindingGroup(String worldName, int cols, int rows, int radius) {
             this.worldName = worldName;
@@ -994,6 +1291,16 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
 
         private final Map<UUID, Long> seen = new HashMap<>();
 
+        private World rangeWorld;
+        private Location rangeCenter;
+        private int rangeMaxDist;
+
+        synchronized void setRange(World w, Location center, int maxDist) {
+            this.rangeWorld = w;
+            this.rangeCenter = (center == null ? null : center.clone());
+            this.rangeMaxDist = maxDist;
+        }
+
         DataRenderer() {
             super(true);
         }
@@ -1029,6 +1336,19 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
 
         @Override
         public void render(MapView map, MapCanvas canvas, Player player) {
+            // —— 距离拦截：不在范围内就直接 return，不要更新 seen ——
+            if (rangeMaxDist > 0) {
+                if (player.getWorld() != rangeWorld)
+                    return;
+                Location lp = player.getLocation();
+                double dx = lp.getX() - rangeCenter.getX();
+                double dy = lp.getY() - rangeCenter.getY();
+                double dz = lp.getZ() - rangeCenter.getZ();
+                if ((dx * dx + dy * dy + dz * dz) > (double) rangeMaxDist * (double) rangeMaxDist) {
+                    return;
+                }
+            }
+
             long sv = seen.getOrDefault(player.getUniqueId(), -1L);
             long epoch;
             byte[] src;
