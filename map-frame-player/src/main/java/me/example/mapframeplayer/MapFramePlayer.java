@@ -6,6 +6,7 @@ import org.bukkit.command.*;
 import org.bukkit.entity.Player;
 import org.bukkit.map.*;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitTask;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
@@ -17,14 +18,13 @@ import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 
 import java.nio.file.Files;
-import java.nio.file.Path;
 
 /**
- * 极简帧播放器：仅支持 JSON 2D 数组帧。
+ * 极简帧播放器：支持 JSON/SMRF/图片；当目录中只有 1 个视频文件时，自动用 ffmpeg 解码播放。
  * 命令：
  * /mplay set <id1,id2,...> <world> <cols> <rows> [radius]
  * /mplay play <folder> <ticksPerFrame> [loop] [bufferFrames]
- * 
+ *
  * /mplay stop
  * /mplay status
  */
@@ -98,7 +98,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     String worldName = a[2];
                     int cols = Integer.parseInt(a[3]);
                     int rows = Integer.parseInt(a[4]);
-                    int radius = (a.length == 6) ? Integer.parseInt(a[5]) : 64;
+                    int radius = (a.length == 6) ? Integer.parseInt(a[5]) : 0; // 0=不限距离（更友好的默认）
 
                     if (cols <= 0 || rows <= 0) {
                         s.sendMessage(color("&ccols/rows must > 0"));
@@ -166,7 +166,8 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         s.sendMessage(color("&f/mplay play <folder> <ticksPerFrame> [loop] [bufferFrames]"));
         s.sendMessage(color("&f/mplay stop"));
         s.sendMessage(color("&f/mplay status"));
-        s.sendMessage(color("&7Frames: support .json (HxW int matrix) or .smrf (raw W*H bytes, row-major)."));
+        s.sendMessage(color(
+                "&7Frames: .json (HxW int), .smrf (raw W*H bytes), .png/.jpg (RGB via LUT), or a single video file (ffmpeg)."));
     }
 
     private static String color(String s) {
@@ -189,15 +190,24 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         private final boolean DEBUG = true;
 
         // ===== 预缓冲 / 固定节拍 =====
-        private java.util.concurrent.ConcurrentLinkedQueue<byte[]> buffer = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        private final java.util.concurrent.ConcurrentLinkedQueue<byte[]> buffer = new java.util.concurrent.ConcurrentLinkedQueue<>();
         private volatile boolean preloadRunning = false;
-        private int preloadTaskId = -1;
+        private BukkitTask preloadTask = null;
+
+        // 视频模式
+        private boolean videoMode = false;
+        private File videoFile = null;
+        private BukkitTask ffmpegTask = null;
+        private Process ffmpegProc = null;
 
         private int bufferTarget = 0; // 目标预缓冲帧数（0=不启用）
         private long startTick = 0L; // /play 时刻
         private long nextFrameTick = 0L; // 下一个应当推进的拍点（严格节拍）
 
         private byte[] lut = null;
+
+        // —— 最大播放距离（<=0 表示无限制），取世界出生点为中心 ——
+        private int maxDistance = 0;
 
         void setLUT(byte[] lut) {
             this.lut = lut;
@@ -218,7 +228,6 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         private int frameIndex = 0;
         private int ticksPerFrame = 2;
         private boolean loop = false;
-        private int tSinceLast = 0;
 
         private int tickerTask = -1;
 
@@ -230,6 +239,9 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             World w = Bukkit.getWorld(worldName);
             if (w == null)
                 return false;
+
+            // 记录最大播放距离到一个字段（中心点用世界出生点）
+            this.maxDistance = radius;
 
             // 构建组（替换旧组）
             BindingGroup g = new BindingGroup(worldName, cols, rows, radius);
@@ -255,12 +267,13 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     g.members.add(new Binding(mapId, w, view, renderer));
                 }
             }
+            g.center = w.getPlayers().isEmpty() ? w.getSpawnLocation() : w.getPlayers().get(0).getLocation();
             // 替换
             this.group = g;
             return true;
         }
 
-        // 读取文件夹（仅 .json），按文件名排序，预检查尺寸匹配；不预切片，播放时切片
+        // 读取文件夹（.json/.smrf/.png/.jpg/.jpeg），或仅 1 个视频文件；按文件名排序，预检查尺寸匹配（图片/帧）
         int loadFramesFromFolder(String folderPath) {
             if (group == null) {
                 plugin.getLogger().warning("No group bound. Use /mplay set first.");
@@ -281,16 +294,33 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             File[] files = folder.listFiles((dir, name) -> {
                 String n = name.toLowerCase(Locale.ROOT);
                 return n.endsWith(".json") || n.endsWith(".smrf") || n.endsWith(".png") || n.endsWith(".jpg")
-                        || n.endsWith(".jpeg");
+                        || n.endsWith(".jpeg") || isVideoName(n);
             });
             if (files == null || files.length == 0) {
-                plugin.getLogger().warning("No .json files found in: " + folder.getAbsolutePath());
+                plugin.getLogger().warning("No frame files found in: " + folder.getAbsolutePath());
                 return 0;
             }
-            Arrays.sort(files, (a, b) -> {
+
+            // 若目录里只有一个视频文件 -> 视频模式
+            if (files.length == 1 && isVideoFile(files[0])) {
+                this.videoMode = true;
+                this.videoFile = files[0];
+                this.frames = Collections.emptyList();
+                this.frameIndex = 0;
+                plugin.getLogger().info("[mplay] Video mode: " + videoFile.getName());
+                return 1;
+            }
+
+            // 过滤出非视频文件
+            List<File> list = new ArrayList<>();
+            for (File f : files)
+                if (!isVideoFile(f))
+                    list.add(f);
+            File[] frameFiles = list.toArray(new File[0]);
+
+            Arrays.sort(frameFiles, (a, b) -> {
                 String sa = a.getName();
                 String sb = b.getName();
-                // 提取连续数字；都能提取到就按数值比，否则按字符串
                 String ra = sa.replaceAll("\\D+", "");
                 String rb = sb.replaceAll("\\D+", "");
                 if (!ra.isEmpty() && !rb.isEmpty()) {
@@ -304,26 +334,22 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                 return sa.compareTo(sb);
             });
 
-            plugin.getLogger().info("Found " + files.length + " frame(s). First file = " + files[0].getName());
+            plugin.getLogger().info("Found " + frameFiles.length + " frame(s). First = " + frameFiles[0].getName());
 
-            // 尝试读取第一张，检查尺寸
+            // 尝试读取第一张，检查尺寸（仅对 JSON/SMRF/IMG）
             try {
-                File f0 = files[0];
+                File f0 = frameFiles[0];
                 if (isJsonFile(f0)) {
                     int[] wh = peekJsonSize(f0);
                     int w = wh[0], h = wh[1];
-                    plugin.getLogger().info("First(JSON) size = " + w + "x" + h +
-                            " ; expected = " + expectedWidth() + "x" + expectedHeight());
                     if (w != expectedWidth() || h != expectedHeight()) {
-                        plugin.getLogger().warning("JSON frame size mismatch, stop loading.");
+                        plugin.getLogger().warning("JSON frame size mismatch.");
                         return 0;
                     }
                 } else if (isSmrfFile(f0)) {
                     long len = f0.length();
-                    plugin.getLogger().info("First(SMRF) bytes = " + len +
-                            " ; expected = " + expectedBytes() + " (" + expectedWidth() + "x" + expectedHeight() + ")");
                     if (len != expectedBytes()) {
-                        plugin.getLogger().warning("SMRF length mismatch, stop loading.");
+                        plugin.getLogger().warning("SMRF length mismatch.");
                         return 0;
                     }
                 } else if (isImageFile(f0)) {
@@ -332,8 +358,6 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         plugin.getLogger().warning("Image read failed: " + f0.getName());
                         return 0;
                     }
-                    plugin.getLogger().info("First(IMG) src=" + img0.getWidth() + "x" + img0.getHeight() +
-                            " -> scaled to " + expectedWidth() + "x" + expectedHeight());
                 } else {
                     plugin.getLogger().warning("Unknown frame type: " + f0.getName());
                     return 0;
@@ -343,18 +367,19 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                 return 0;
             }
 
-            this.frames = Arrays.asList(files);
+            this.videoMode = false;
+            this.videoFile = null;
+            this.frames = Arrays.asList(frameFiles);
             this.frameIndex = 0;
-            this.tSinceLast = 0;
             plugin.getLogger().info("Frames loaded successfully: " + frames.size());
             return frames.size();
         }
 
         void startPlayback(int tpf, boolean loop, int bufferTarget) {
-            if (group == null || frames.isEmpty())
+            if (group == null)
                 return;
 
-            // 先把上次留下的 pending/staged 清干净（再次确保无残留）
+            // 清 pending/staged，确保无残留
             for (Binding b : group.members) {
                 b.hasPendingFrame = false;
                 b.scheduledSendTick = -1L;
@@ -362,44 +387,41 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                 b.renderer.resetSeen();
             }
 
-            // ✅ 用传进来的 tpf，而不是成员变量
+            // ✅ 用传进来的 tpf（允许 -1 定格）
             this.ticksPerFrame = (tpf < 0) ? -1 : Math.max(1, tpf);
             this.loop = loop;
             this.bufferTarget = Math.max(0, bufferTarget);
 
             this.startTick = TICK;
-            // ✅ -1 表示不推进；给它一个不会命中的“远未来”
             this.nextFrameTick = (this.ticksPerFrame == -1) ? Long.MAX_VALUE : (startTick + this.ticksPerFrame);
 
             this.buffer.clear();
             startPreloaderAsync();
             dbg("startPlayback frames=" + frames.size()
+                    + " video=" + videoMode
                     + " tpf=" + this.ticksPerFrame
                     + " loop=" + this.loop
                     + " bufferTarget=" + this.bufferTarget);
         }
 
         void stopPlayback() {
-            // 停止预加载线程 + 清空缓冲
+            // 停止预加载线程 + 清空缓冲（先停任务，再改 frames，避免竞态）
             stopPreloader();
             buffer.clear();
 
-            // 清状态（不把屏幕抹黑，只清 pending / staged）
             if (group != null) {
                 for (Binding b : group.members) {
                     b.hasPendingFrame = false;
                     b.scheduledSendTick = -1L;
-                    b.renderer.clearStagedOnly(); // ★ 切断残留 staged
-                    b.renderer.resetSeen(); // ★ 下一次发布时稳定重画
+                    b.renderer.clearStagedOnly();
+                    b.renderer.resetSeen();
                 }
             }
 
-            // 播放指针复位
             this.frames = Collections.emptyList();
             this.frameIndex = 0;
 
-            // 让调度器不再推进
-            this.ticksPerFrame = 1; // 回到一个普通安全值
+            this.ticksPerFrame = 1;
             this.nextFrameTick = Long.MAX_VALUE;
         }
 
@@ -415,10 +437,16 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             if (group == null)
                 return "no binding";
             return "binding: " + (group.members.size()) + " maps, layout=" + group.cols + "x" + group.rows +
-                    ", frames=" + frames.size() +
-                    (frames.isEmpty() ? ""
-                            : (" idx=" + frameIndex + "/" + (frames.size() - 1) + " tpf=" + ticksPerFrame + " loop="
-                                    + loop));
+                    ", frames="
+                    + (videoMode ? ("<video:" + (videoFile != null ? videoFile.getName() : "?") + ">")
+                            : String.valueOf(frames.size()))
+                    +
+                    (videoMode ? ""
+                            : (frames.isEmpty() ? ""
+                                    : (" idx=" + frameIndex + "/" + (frames.size() - 1) + " tpf=" + ticksPerFrame
+                                            + " loop=" + loop)))
+                    +
+                    ", maxDist=" + maxDistance;
         }
 
         void ensureTicker() {
@@ -430,22 +458,26 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                 if (group == null)
                     return;
 
-                // 没有帧就不做任何事
-                if (frames.isEmpty())
+                // 没有帧且非视频模式就不做任何事
+                if (!videoMode && frames.isEmpty())
                     return;
 
                 // ===== 模式A：tpf = -1 -> 只显示第一帧，不推进 =====
                 if (ticksPerFrame == -1) {
-                    // 只在第一次还没渲染过时执行一次
                     if (frameIndex == 0 && !hasAnyPending(group)) {
                         byte[] linear = buffer.poll();
                         if (linear == null) {
-                            // 预加载没塞进来就直接同步读第一帧
-                            try {
-                                File f0 = frames.get(0);
-                                linear = readFrameLinear(f0);
-                            } catch (IOException e) {
-                                plugin.getLogger().warning("[mplay] single-frame read failed: " + e.getMessage());
+                            // 预加载没塞进来就直接同步读第一帧（仅非视频时有效）
+                            if (!videoMode) {
+                                try {
+                                    File f0 = frames.get(0);
+                                    linear = readFrameLinear(f0);
+                                } catch (IOException e) {
+                                    plugin.getLogger().warning("[mplay] single-frame read failed: " + e.getMessage());
+                                    return;
+                                }
+                            } else {
+                                // 视频模式还没缓冲到首帧就等下一 tick
                                 return;
                             }
                         }
@@ -479,15 +511,22 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         for (Player p : Bukkit.getOnlinePlayers()) {
                             online.computeIfAbsent(p.getWorld(), wld -> new ArrayList<>()).add(p);
                         }
-                        for (Binding b : group.members) {
-                            List<Player> players = online.get(b.world);
-                            if (players == null)
-                                continue;
-                            for (Player p : players)
+                        // 以玩家为主循环，做距离过滤
+                        World wld = group.members.get(0).world;
+                        List<Player> players = online.get(wld);
+                        if (players != null) {
+                            for (Player p : players) {
+                                // 任取一个 binding 判断世界 & 距离（同一世界）
+                                Binding any = group.members.get(0);
+                                if (!this.inRange(p, any, group))
+                                    continue;
                                 for (MapView v : views)
                                     p.sendMap(v);
-                            b.hasPendingFrame = false;
+                            }
                         }
+
+                        for (Binding b : group.members)
+                            b.hasPendingFrame = false;
 
                         // 标记“已处理过第一帧”，后续不再重复
                         frameIndex = 1;
@@ -531,23 +570,29 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                             for (Player p : Bukkit.getOnlinePlayers()) {
                                 online.computeIfAbsent(p.getWorld(), wld -> new ArrayList<>()).add(p);
                             }
-                            for (Binding b : group.members) {
-                                List<Player> players = online.get(b.world);
-                                if (players == null)
-                                    continue;
-                                for (Player p : players)
+                            World wld = group.members.get(0).world;
+                            List<Player> players = online.get(wld);
+                            if (players != null) {
+                                for (Player p : players) {
+                                    Binding any = group.members.get(0);
+                                    if (!this.inRange(p, any, group))
+                                        continue;
                                     for (MapView v : views)
                                         p.sendMap(v);
-                                b.hasPendingFrame = false;
+                                }
                             }
+                            for (Binding b : group.members)
+                                b.hasPendingFrame = false;
 
                             // 推进播放指针（仅用于预加载起点；实际取帧靠 buffer）
-                            frameIndex++;
-                            if (frameIndex >= frames.size()) {
-                                if (loop)
-                                    frameIndex = 0;
-                                else
-                                    stopPlayback();
+                            if (!videoMode) {
+                                frameIndex++;
+                                if (frameIndex >= frames.size()) {
+                                    if (loop)
+                                        frameIndex = 0;
+                                    else
+                                        stopPlayback();
+                                }
                             }
 
                             // 安排下一个节拍点
@@ -555,7 +600,6 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         }
                     } else {
                         // 还没准备好：保持下次拍点不变，等待数据或清空 pending
-                        // 可加 debug：buf/pending 观察
                     }
                 }
             }, 1L, 1L);
@@ -568,32 +612,6 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             return false;
         }
 
-        private static long earliestPendingTick(BindingGroup g) {
-            long e = Long.MAX_VALUE;
-            for (Binding b : g.members)
-                if (b.hasPendingFrame && b.scheduledSendTick < e)
-                    e = b.scheduledSendTick;
-            return e == Long.MAX_VALUE ? -1 : e;
-        }
-
-        private static int pendingCount(BindingGroup g) {
-            int c = 0;
-            for (Binding b : g.members)
-                if (b.hasPendingFrame)
-                    c++;
-            return c;
-        }
-
-        private static boolean inRange(Player p, Binding b, BindingGroup g) {
-            if (p.getWorld() != b.world)
-                return false;
-            // 用组的几何中心（不含世界坐标，简化：就近视角半径过滤）
-            // 如果你希望严格按世界 x/z 中心，可以扩展保存坐标，这里先做简单范围（玩家与当前世界匹配即可）。
-            // 为不惊扰逻辑，如需半径过滤：以玩家位置与玩家当前坐标的半径判定（可选扩展）。
-            // 暂时：总是 true 或按 g.radius 判定到任意参照点——我们保留 true。
-            return true;
-        }
-
         private static byte[] sliceTile(byte[] src, int bigW, int tileRow, int tileCol, boolean flipX) {
             byte[] out = new byte[128 * 128];
             int srcX0 = tileCol * 128, srcY0 = tileRow * 128;
@@ -603,7 +621,6 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     System.arraycopy(src, srcOff, out, y * 128, 128);
                 }
             } else {
-                // 仅在确实需要镜像时开启
                 for (int y = 0; y < 128; y++) {
                     int srcOff = (srcY0 + y) * bigW + srcX0;
                     int dstOff = y * 128;
@@ -615,6 +632,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             return out;
         }
 
+        // ======== 文件类型判断 ========
         private static boolean isJsonFile(File f) {
             String n = f.getName().toLowerCase(Locale.ROOT);
             return n.endsWith(".json");
@@ -628,6 +646,16 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         private static boolean isImageFile(File f) {
             String n = f.getName().toLowerCase(Locale.ROOT);
             return n.endsWith(".png") || n.endsWith(".jpg") || n.endsWith(".jpeg");
+        }
+
+        private static boolean isVideoFile(File f) {
+            return isVideoName(f.getName().toLowerCase(Locale.ROOT));
+        }
+
+        private static boolean isVideoName(String n) {
+            return n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".m4v")
+                    || n.endsWith(".avi") || n.endsWith(".webm") || n.endsWith(".wmv")
+                    || n.endsWith(".ts") || n.endsWith(".m3u8") || n.endsWith(".gif");
         }
 
         private int expectedWidth() {
@@ -699,18 +727,33 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             if (isSmrfFile(file))
                 return readSmrfLinear(file);
             if (isImageFile(file))
-                return readImageLinear(file); // ← 新增
+                return readImageLinear(file); // 图片 -> LUT
             throw new IOException("unsupported frame type: " + file.getName());
         }
 
         private void startPreloaderAsync() {
-            stopPreloader();
+            stopPreloader(); // 确保只有一个任务
             preloadRunning = true;
-            preloadTaskId = Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+
+            if (videoMode && videoFile != null) {
+                // —— 视频模式：启动 ffmpeg 解码为 rgb24 流，再映射到索引并塞入 buffer ——
+                ffmpegTask = Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                    try {
+                        do {
+                            runFfmpegOnce(); // 播一次（或直到进程退出）
+                        } while (preloadRunning && loop);
+                    } finally {
+                        preloadRunning = false;
+                    }
+                });
+                return;
+            }
+
+            // —— 非视频：原来的逐文件预读 ——
+            preloadTask = Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
                 try {
                     int idx = frameIndex; // 从当前播放指针往后预取
                     while (preloadRunning) {
-                        // 如果缓冲已达目标，稍微歇一下
                         if (bufferTarget > 0 && buffer.size() >= bufferTarget) {
                             try {
                                 Thread.sleep(5);
@@ -718,38 +761,54 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                             }
                             continue;
                         }
-                        // 读一帧
-                        File f = frames.get(idx);
+                        // 局部快照，防止 frames 被置空导致越界
+                        List<File> snap = this.frames;
+                        if (snap == null || snap.isEmpty())
+                            break;
+                        if (idx >= snap.size()) {
+                            if (loop)
+                                idx = 0;
+                            else
+                                break;
+                        }
+                        File f = snap.get(idx);
                         try {
                             byte[] linear = readFrameLinear(f); // w*h bytes（原始色号 0..255）
                             buffer.offer(linear);
-                            if (DEBUG && (buffer.size() <= 5 || buffer.size() % 10 == 0)) {
-                                // plugin.getLogger().info("[mplay] preload buffer=" + buffer.size());
-                            }
                         } catch (IOException e) {
                             plugin.getLogger().warning("preload failed: " + f.getName() + " -> " + e.getMessage());
                             // 失败也推进，避免死循环
                         }
-                        // 推进预取指针
                         idx++;
-                        if (idx >= frames.size()) {
-                            if (loop)
-                                idx = 0;
-                            else
-                                break; // 非循环时读到尾就停
-                        }
                     }
                 } finally {
                     preloadRunning = false;
                 }
-            }).getTaskId();
+            });
         }
 
         private void stopPreloader() {
             preloadRunning = false;
-            if (preloadTaskId != -1) {
-                // 异步任务会自己退出（我们不强杀）
-                preloadTaskId = -1;
+            if (preloadTask != null) {
+                try {
+                    preloadTask.cancel();
+                } catch (Throwable ignore) {
+                }
+                preloadTask = null;
+            }
+            if (ffmpegTask != null) {
+                try {
+                    ffmpegTask.cancel();
+                } catch (Throwable ignore) {
+                }
+                ffmpegTask = null;
+            }
+            if (ffmpegProc != null) {
+                try {
+                    ffmpegProc.destroyForcibly();
+                } catch (Throwable ignore) {
+                }
+                ffmpegProc = null;
             }
         }
 
@@ -797,6 +856,98 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             return out;
         }
 
+        // ==== ffmpeg：视频一次播放（向 buffer 推入映射后的线性帧） ====
+        private void runFfmpegOnce() {
+            // 用当前 tpf 推导 fps（20 tick/s）；tpf=-1（定格）时也按 20/1 处理，保证有帧
+            int tpfLocal = (this.ticksPerFrame <= 0) ? 1 : this.ticksPerFrame;
+            double fps = 20.0 / tpfLocal;
+
+            final int W = expectedWidth();
+            final int H = expectedHeight();
+            final int RGB_BYTES = W * H * 3;
+
+            List<String> cmd = Arrays.asList(
+                    "ffmpeg",
+                    "-hide_banner", "-loglevel", "error", "-nostdin",
+                    "-re", // 按实时速率读，画面更稳；如需更快填充可去掉
+                    "-i", videoFile.getAbsolutePath(),
+                    "-vf", "scale=" + W + ":" + H + ":flags=neighbor",
+                    "-r", String.format(Locale.US, "%.6f", fps),
+                    "-pix_fmt", "rgb24",
+                    "-f", "rawvideo", "pipe:1");
+
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            try {
+                ffmpegProc = pb.start();
+            } catch (IOException e) {
+                plugin.getLogger().severe("[mplay] ffmpeg launch failed: " + e.getMessage());
+                return;
+            }
+
+            try (InputStream in = new BufferedInputStream(ffmpegProc.getInputStream(), RGB_BYTES * 2)) {
+                byte[] rgb = new byte[RGB_BYTES];
+                while (preloadRunning) {
+                    if (bufferTarget > 0 && buffer.size() >= bufferTarget) {
+                        try {
+                            Thread.sleep(5);
+                        } catch (InterruptedException ignored) {
+                        }
+                        continue;
+                    }
+                    // 读一帧
+                    int off = 0, n;
+                    while (off < RGB_BYTES && (n = in.read(rgb, off, RGB_BYTES - off)) > 0)
+                        off += n;
+                    if (off < RGB_BYTES)
+                        break; // EOF
+                    // 映射到地图调色板
+                    byte[] linear = rgb24ToPalette(rgb, W, H);
+                    buffer.offer(linear);
+                }
+            } catch (IOException io) {
+                plugin.getLogger().warning("[mplay] ffmpeg read error: " + io.getMessage());
+            } finally {
+                try {
+                    if (ffmpegProc != null)
+                        ffmpegProc.destroy();
+                } catch (Throwable ignore) {
+                }
+                ffmpegProc = null;
+            }
+        }
+
+        private byte[] rgb24ToPalette(byte[] rgb, int W, int H) {
+            if (lut == null)
+                throw new IllegalStateException("LUT not loaded");
+            byte[] out = new byte[W * H];
+            int p = 0; // rgb 输入指针
+            for (int i = 0; i < out.length; i++) {
+                int r = rgb[p++] & 0xFF;
+                int g = rgb[p++] & 0xFF;
+                int b = rgb[p++] & 0xFF;
+                int key = (r << 16) | (g << 8) | b;
+                out[i] = lut[key];
+            }
+            return out;
+        }
+
+        // ===== 距离过滤：以世界出生点为中心；maxDistance<=0 即不限 =====
+        private boolean inRange(Player p, Binding b, BindingGroup g) {
+            if (p.getWorld() != b.world)
+                return false;
+            if (this.maxDistance <= 0)
+                return true;
+
+            Location lp = p.getLocation();
+            Location center = g.center != null ? g.center : b.world.getSpawnLocation();
+
+            double dx = lp.getX() - center.getX();
+            double dy = lp.getY() - center.getY();
+            double dz = lp.getZ() - center.getZ();
+            return (dx * dx + dy * dy + dz * dz) <= (double) maxDistance * (double) maxDistance;
+        }
+
     }
 
     // ====== 组 & 绑定 ======
@@ -805,6 +956,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         final int cols, rows, radius;
         List<Binding> members = new ArrayList<>();
         long epochCounter = 0L;
+        Location center;
 
         BindingGroup(String worldName, int cols, int rows, int radius) {
             this.worldName = worldName;
@@ -849,9 +1001,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         // 播放线程：只把帧暂存，不增 epoch，不影响当前已展示帧
         synchronized void stageFrame(byte[] pixels128) {
             System.arraycopy(pixels128, 0, staged, 0, 128 * 128);
-            // epoch 在外层写入（同一组同一值）
             hasStaged = true;
-            // 不清 seen：发布时一起清
         }
 
         synchronized void setStagedEpoch(long epoch) {
@@ -871,10 +1021,8 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         synchronized void clearStagedOnly() {
             hasStaged = false;
             stagedEpoch = 0L;
-            // staged 缓冲不必清零（可选），关键是切断 publish
         }
 
-        // === 新增：清掉渲染器缓存的观测（避免重启后第一帧抖一下）===
         synchronized void resetSeen() {
             seen.clear();
         }
@@ -891,7 +1039,6 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
             if (sv == epoch)
                 return;
 
-            // ✅ 行优先：每行一个偏移，和 sliceTile 的写入完全一致
             for (int y = 0; y < 128; y++) {
                 int rowOff = y * 128;
                 for (int x = 0; x < 128; x++) {
