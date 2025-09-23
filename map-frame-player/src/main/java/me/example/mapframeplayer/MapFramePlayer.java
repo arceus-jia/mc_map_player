@@ -58,6 +58,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         }
 
         binds.ensureTicker();
+        binds.loadPersistedScreens();
     }
 
     @Override
@@ -81,7 +82,6 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         try {
             switch (sub) {
                 case "create": {
-                    // /mplay create <cols> <rows> [radius] [x y z]
                     if (!(s instanceof Player)) {
                         s.sendMessage(color("&cThis command must be run by a player."));
                         return true;
@@ -96,7 +96,6 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     int cols = Integer.parseInt(a[1]);
                     int rows = Integer.parseInt(a[2]);
 
-                    // 限制最大 16x9
                     if (cols <= 0 || rows <= 0 || cols * rows > 16 * 9) {
                         s.sendMessage(color("&cScreen too large. Max size is 16x9. You asked: " + cols + "x" + rows));
                         return true;
@@ -106,16 +105,13 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     Location anchor = null;
 
                     if (a.length == 4) {
-                        // 只有 radius
                         radius = Integer.parseInt(a[3]);
                     } else if (a.length == 6) {
-                        // 只有 xyz（radius=0）
                         int x = Integer.parseInt(a[3]);
                         int y = Integer.parseInt(a[4]);
                         int z = Integer.parseInt(a[5]);
                         anchor = new Location(ps.getWorld(), x, y, z);
                     } else if (a.length == 7) {
-                        // radius + xyz
                         radius = Integer.parseInt(a[3]);
                         int x = Integer.parseInt(a[4]);
                         int y = Integer.parseInt(a[5]);
@@ -123,12 +119,13 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         anchor = new Location(ps.getWorld(), x, y, z);
                     }
 
-                    boolean ok = binds.createAndBindFloatingAtPlayer(ps, cols, rows, radius, /* forward */2, anchor);
-                    if (!ok) {
+                    Integer screenId = binds.createAndBindFloatingAtPlayer(ps, cols, rows, radius, /* forward */2,
+                            anchor);
+                    if (screenId == null) {
                         s.sendMessage(color("&cCreate failed. Make sure there is free space."));
                     } else {
-                        s.sendMessage(color("&aCreated a " + cols + "x" + rows + " screen. radius=" + radius
-                                + (anchor != null
+                        s.sendMessage(color("&aCreated screen #" + screenId + " (" + cols + "x" + rows + ") radius="
+                                + radius + (anchor != null
                                         ? (" at " + anchor.getBlockX() + "," + anchor.getBlockY() + ","
                                                 + anchor.getBlockZ())
                                         : " (in front of you)")));
@@ -136,7 +133,6 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     return true;
                 }
                 case "set": {
-                    // /mplay set <id1,id2,...> <world> <cols> <rows> [radius]
                     if (a.length < 5 || a.length > 6) {
                         help(s);
                         return true;
@@ -148,15 +144,15 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     String worldName = a[2];
                     int cols = Integer.parseInt(a[3]);
                     int rows = Integer.parseInt(a[4]);
-                    int radius = (a.length == 6) ? Integer.parseInt(a[5]) : 0; // 0=不限距离（更友好的默认）
+                    int radius = (a.length == 6) ? Integer.parseInt(a[5]) : 0;
 
                     if (cols <= 0 || rows <= 0) {
                         s.sendMessage(color("&ccols/rows must > 0"));
                         return true;
                     }
                     if (ids.length != cols * rows) {
-                        s.sendMessage(
-                                color("&cmapId count mismatch cols*rows: " + ids.length + " != " + (cols * rows)));
+                        s.sendMessage(color(
+                                "&cmapId count mismatch cols*rows: " + ids.length + " != " + (cols * rows)));
                         return true;
                     }
 
@@ -166,62 +162,124 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         if (ps.getWorld().getName().equals(worldName))
                             center = ps.getLocation();
                     }
-                    boolean ok = binds.bind(ids, worldName, cols, rows, radius, center);
+                    Integer screenId = binds.bind(ids, worldName, cols, rows, radius, center);
 
-                    if (!ok) {
+                    if (screenId == null) {
                         s.sendMessage(color("&cBind failed. Check world and map ids."));
                     } else {
-                        s.sendMessage(color(
-                                "&aBound " + ids.length + " maps. layout=" + cols + "x" + rows + " radius=" + radius));
+                        s.sendMessage(color("&aBound screen #" + screenId + " layout=" + cols + "x" + rows
+                                + " radius=" + radius));
                     }
                     return true;
                 }
                 case "play": {
-                    // /mplay play <folder> <ticksPerFrame> [loop] [bufferFrames]
-                    if (a.length < 2 || a.length > 6) {
-                        help(s);
-                        return true;
-                    }
-                    String folder = a[1];
-                    int tpf = (a.length >= 3) ? Integer.parseInt(a[2]) : 1;
-                    boolean loop = (a.length >= 4) ? Boolean.parseBoolean(a[3]) : false;
-                    int warmup = (a.length >= 5) ? Integer.parseInt(a[4]) : 0; // 新：warmupTicks
+                    TargetParseResult target = parseOptionalScreenId(a, 1);
+                    int idx = target.nextIndex;
+                    Integer screenId = target.screenId != null ? target.screenId : binds.lastActiveId();
 
-                    int loaded = binds.loadFramesFromFolder(folder);
-                    if (loaded <= 0) {
-                        s.sendMessage(color("&cNo frames loaded. Check folder & size. " + folder));
+                    if (idx >= a.length) {
+                        s.sendMessage(color("&f/mplay play [id <screenId>] <folder> [tpf] [loop] [warmupTicks]"));
                         return true;
                     }
-                    binds.startPlayback(tpf, loop, /* bufferTarget */ 0, /* warmupTicks */ warmup);
-                    s.sendMessage(color("&aPlaying " + loaded + " frames at " + tpf + " tpf; loop=" + loop
+
+                    if (screenId == null) {
+                        s.sendMessage(color("&cNo screen selected. Use id or create one first."));
+                        return true;
+                    }
+
+                    String folder = a[idx++];
+                    int tpf = (idx < a.length) ? Integer.parseInt(a[idx++]) : 1;
+                    boolean loop = (idx < a.length) ? Boolean.parseBoolean(a[idx++]) : false;
+                    int warmup = (idx < a.length) ? Integer.parseInt(a[idx++]) : 0;
+
+                    int loaded = binds.loadFramesFromFolder(screenId, folder);
+                    if (loaded <= 0) {
+                        s.sendMessage(color("&cNo frames loaded for screen #" + screenId + ". Check folder & size."));
+                        return true;
+                    }
+                    binds.startPlayback(screenId, tpf, loop, 0, warmup);
+                    s.sendMessage(color("&aScreen #" + screenId + " playing " + loaded + " frame(s) at " + tpf
+                            + " tpf; loop=" + loop
                             + (warmup > 0 ? (" warmupTicks=" + warmup) : "")));
                     return true;
-
                 }
 
                 case "stop": {
-                    binds.stopPlayback();
-                    s.sendMessage(color("&aPlayback stopped."));
+                    if (a.length >= 2 && a[1].equalsIgnoreCase("all")) {
+                        int stopped = binds.stopAllPlayback();
+                        s.sendMessage(color("&aStopped playback on " + stopped + " screen(s)."));
+                        return true;
+                    }
+                    TargetParseResult target = parseOptionalScreenId(a, 1);
+                    Integer screenId = target.screenId != null ? target.screenId : binds.lastActiveId();
+                    if (screenId == null) {
+                        s.sendMessage(color("&cNo screen selected to stop."));
+                        return true;
+                    }
+                    boolean ok = binds.stopPlayback(screenId);
+                    if (ok)
+                        s.sendMessage(color("&aStopped playback on screen #" + screenId + "."));
+                    else
+                        s.sendMessage(color("&cScreen #" + screenId + " not found."));
                     return true;
                 }
                 case "status": {
-                    s.sendMessage(color("&f" + binds.statusString()));
+                    if (a.length >= 2 && a[1].equalsIgnoreCase("all")) {
+                        for (String line : binds.listStatus())
+                            s.sendMessage(color("&f" + line));
+                        return true;
+                    }
+                    TargetParseResult target = parseOptionalScreenId(a, 1);
+                    Integer screenId = target.screenId != null ? target.screenId : binds.lastActiveId();
+                    if (screenId == null) {
+                        s.sendMessage(color("&cNo screen selected."));
+                        return true;
+                    }
+                    s.sendMessage(color("&f" + binds.statusString(screenId)));
+                    return true;
+                }
+                case "list": {
+                    if (!binds.hasScreens()) {
+                        s.sendMessage(color("&7No screens registered."));
+                        return true;
+                    }
+                    for (String line : binds.listStatus())
+                        s.sendMessage(color("&f" + line));
                     return true;
                 }
                 case "clear": {
-                    boolean ok = binds.clearScreen();
+                    if (a.length >= 2 && a[1].equalsIgnoreCase("all")) {
+                        int cleared = binds.clearAllScreens();
+                        s.sendMessage(cleared > 0
+                                ? color("&aCleared " + cleared + " screen(s).")
+                                : color("&cNo screens to clear."));
+                        return true;
+                    }
+                    TargetParseResult target = parseOptionalScreenId(a, 1);
+                    Integer screenId = target.screenId != null ? target.screenId : binds.lastActiveId();
+                    if (screenId == null) {
+                        s.sendMessage(color("&cNo screen selected to clear."));
+                        return true;
+                    }
+                    boolean ok = binds.clearScreen(screenId);
                     if (ok)
-                        s.sendMessage(color("&aCleared current screen and invisible backing."));
+                        s.sendMessage(color("&aCleared screen #" + screenId + " (frames + barrier)."));
                     else
-                        s.sendMessage(color("&cNo active screen to clear."));
+                        s.sendMessage(color("&cScreen #" + screenId + " not found."));
                     return true;
                 }
                 case "reset": {
-                    boolean ok = binds.resetToBlack();
+                    TargetParseResult target = parseOptionalScreenId(a, 1);
+                    Integer screenId = target.screenId != null ? target.screenId : binds.lastActiveId();
+                    if (screenId == null) {
+                        s.sendMessage(color("&cNo screen selected to reset."));
+                        return true;
+                    }
+                    boolean ok = binds.resetToBlack(screenId);
                     if (ok)
-                        s.sendMessage(color("&aScreen reset to black."));
+                        s.sendMessage(color("&aScreen #" + screenId + " reset to black."));
                     else
-                        s.sendMessage(color("&cNo active binding to reset."));
+                        s.sendMessage(color("&cScreen #" + screenId + " not found."));
                     return true;
                 }
 
@@ -237,22 +295,60 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
 
     private void help(CommandSender s) {
         s.sendMessage(color("&eUsage:"));
+        s.sendMessage(color("&f/mplay create <cols> <rows> [radius] [x y z]"));
         s.sendMessage(color("&f/mplay set <id1,id2,...> <world> <cols> <rows> [radius]"));
-        s.sendMessage(color("&f/mplay play <folder> <ticksPerFrame> [loop] [warmupTicks]"));
+        s.sendMessage(color("&f/mplay list"));
+        s.sendMessage(color("&f/mplay play [id <screenId>] <folder> [tpf] [loop] [warmupTicks]"));
         s.sendMessage(color("&7warmupTicks: 开播前延迟的 tick 数（20 tick = 1 秒）"));
-
-        s.sendMessage(color("&f/mplay stop"));
-        s.sendMessage(color("&f/mplay status"));
+        s.sendMessage(color("&f/mplay stop [id <screenId>|all]"));
+        s.sendMessage(color("&f/mplay status [id <screenId>|all]"));
+        s.sendMessage(color("&f/mplay clear [id <screenId>|all]"));
+        s.sendMessage(color("&f/mplay reset [id <screenId>]"));
         s.sendMessage(color(
                 "&7Frames: .json (HxW int), .smrf (raw W*H bytes), .png/.jpg (RGB via LUT), or a single video file (ffmpeg)."));
-
-        s.sendMessage(color("&f/mplay create <cols> <rows> [radius] [x y z]"));
-        s.sendMessage(color("&f/mplay clear  &7— remove the last created screen (frames + barrier)"));
-        s.sendMessage(color("&f/mplay reset  &7— stop playback and show a black screen"));
 
     }
 
     private static String color(String s) {
         return ChatColor.translateAlternateColorCodes('&', s);
+    }
+
+    private TargetParseResult parseOptionalScreenId(String[] args, int start) {
+        if (start >= args.length)
+            return new TargetParseResult(null, start);
+
+        String token = args[start];
+        if ("id".equalsIgnoreCase(token)) {
+            if (start + 1 >= args.length)
+                throw new NumberFormatException("missing screen id");
+            int id = Integer.parseInt(args[start + 1]);
+            return new TargetParseResult(id, start + 2);
+        }
+
+        if (isNumeric(token)) {
+            int id = Integer.parseInt(token);
+            return new TargetParseResult(id, start + 1);
+        }
+
+        return new TargetParseResult(null, start);
+    }
+
+    private boolean isNumeric(String token) {
+        try {
+            Integer.parseInt(token);
+            return true;
+        } catch (NumberFormatException ignore) {
+            return false;
+        }
+    }
+
+    private static class TargetParseResult {
+        final Integer screenId;
+        final int nextIndex;
+
+        TargetParseResult(Integer screenId, int nextIndex) {
+            this.screenId = screenId;
+            this.nextIndex = nextIndex;
+        }
     }
 }

@@ -16,6 +16,7 @@ class BindingGroup {
     Location center;
     List<Location> placedBarriers = new ArrayList<>();
     List<UUID> frameUUIDs = new ArrayList<>();
+    List<Location> frameLocations = new ArrayList<>();
 
     BindingGroup(String worldName, int cols, int rows, int radius) {
         this.worldName = worldName;
