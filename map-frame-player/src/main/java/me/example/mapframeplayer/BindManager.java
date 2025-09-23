@@ -147,6 +147,53 @@ class BindManager {
         });
     }
 
+    void startLiveStream(int screenId, String source, int requestedTpf, Integer bufferFrames,
+            CommandSender feedback) {
+        ScreenSession session = sessions.get(screenId);
+        if (session == null) {
+            sendFeedback(feedback, "Screen #" + screenId + " not found.");
+            return;
+        }
+        if (session.group == null || session.group.members == null || session.group.members.isEmpty()) {
+            sendFeedback(feedback, "Screen #" + screenId + " has no binding. Create or set first.");
+            return;
+        }
+
+        String url = null;
+        String label = source;
+        if (source.contains("://")) {
+            url = source;
+        } else {
+            String safeName = sanitizeName(source);
+            File framesRoot = new File(plugin.getDataFolder(), "frames");
+            File targetDir = new File(framesRoot, safeName);
+            if (!targetDir.exists() || !targetDir.isDirectory()) {
+                sendFeedback(feedback, "Media '" + source + "' not found under frames/.");
+                return;
+            }
+            File candidate = new File(targetDir, "bilibili.m3u8.txt");
+            if (!candidate.exists()) {
+                sendFeedback(feedback, "Media '" + source + "' does not contain bilibili.m3u8.txt.");
+                return;
+            }
+            try {
+                url = Files.readString(candidate.toPath(), StandardCharsets.UTF_8).trim();
+            } catch (IOException e) {
+                sendFeedback(feedback, "Failed to read " + candidate.getName() + ": " + e.getMessage());
+                return;
+            }
+            if (url.isEmpty()) {
+                sendFeedback(feedback, "bilibili.m3u8.txt is empty.");
+                return;
+            }
+            label = source + "/bilibili";
+        }
+
+        session.startLiveStream(url, label, requestedTpf, bufferFrames != null ? bufferFrames : 0);
+        saveSessions();
+        sendFeedback(feedback, "Screen #" + screenId + " streaming from " + url);
+    }
+
     List<String> listMediaEntries() {
         File framesRoot = new File(plugin.getDataFolder(), "frames");
         if (!framesRoot.exists() || !framesRoot.isDirectory())
@@ -788,6 +835,7 @@ class BindManager {
         final int id;
         final BindingGroup group;
         final int maxDistance;
+        private static final int DEFAULT_LIVE_QUEUE_LIMIT = 30;
         private String sourceLabel = "";
 
         private final ConcurrentLinkedQueue<byte[]> buffer = new ConcurrentLinkedQueue<>();
@@ -798,6 +846,9 @@ class BindManager {
 
         private boolean videoMode = false;
         private File videoFile = null;
+        private boolean liveMode = false;
+        private String liveUrl = null;
+        private int liveQueueLimit = DEFAULT_LIVE_QUEUE_LIMIT;
 
         private List<File> frames = Collections.emptyList();
         private int frameIndex = 0;
@@ -833,7 +884,7 @@ class BindManager {
         void onTick(long tick) {
             if (group.members.isEmpty())
                 return;
-            if (!videoMode && frames.isEmpty())
+            if (!videoMode && !liveMode && frames.isEmpty())
                 return;
             if (tick < (startTick + warmupTicks))
                 return;
@@ -863,6 +914,15 @@ class BindManager {
                 return;
             }
 
+            if (ticksPerFrame == 0) {
+                if (!hasAnyPending()) {
+                    byte[] linear = buffer.poll();
+                    if (linear != null)
+                        publishFrame(linear);
+                }
+                return;
+            }
+
             if (tick >= nextFrameTick) {
                 boolean ready = !buffer.isEmpty();
                 if (bufferTarget > 0 && buffer.size() < bufferTarget)
@@ -873,7 +933,7 @@ class BindManager {
                     if (linear != null) {
                         publishFrame(linear);
 
-                        if (!videoMode) {
+                        if (!videoMode && !liveMode) {
                             frameIndex++;
                             if (frameIndex >= frames.size()) {
                                 if (loop) {
@@ -941,6 +1001,8 @@ class BindManager {
                         lut);
                 this.videoMode = result.videoMode;
                 this.videoFile = result.videoFile;
+                this.liveMode = false;
+                this.liveUrl = null;
                 this.frames = result.frameFiles;
                 this.frameIndex = 0;
                 this.sourceLabel = result.sourceLabel != null ? result.sourceLabel : folderPath;
@@ -952,16 +1014,52 @@ class BindManager {
             }
         }
 
+        void startLiveStream(String url, String label, int requestedTpf, int bufferFrames) {
+            if (group.members.isEmpty())
+                return;
+
+            resetRenderers();
+            stopPreloader();
+            buffer.clear();
+
+            this.frames = Collections.emptyList();
+            this.frameIndex = 0;
+            this.videoMode = false;
+            this.videoFile = null;
+            this.liveMode = true;
+            this.liveUrl = url;
+            this.sourceLabel = label != null ? label : url;
+            this.loop = true; // keep ffmpeg reconnecting
+            this.bufferTarget = 0;
+            this.warmupTicks = 0;
+            this.liveQueueLimit = (bufferFrames > 0) ? bufferFrames : DEFAULT_LIVE_QUEUE_LIMIT;
+
+            if (requestedTpf < 0)
+                this.ticksPerFrame = -1;
+            else if (requestedTpf == 0)
+                this.ticksPerFrame = 0;
+            else
+                this.ticksPerFrame = Math.max(1, requestedTpf);
+
+            this.startTick = MapFramePlayer.TICK;
+            this.nextFrameTick = (this.ticksPerFrame <= 0)
+                    ? MapFramePlayer.TICK
+                    : (startTick + this.ticksPerFrame);
+
+            startPreloaderAsync();
+            dbg("screen " + id + " startLiveStream url=" + url + " tpf=" + this.ticksPerFrame
+                    + " liveQueueLimit=" + this.liveQueueLimit);
+        }
+
         void startPlayback(int tpf, boolean loop, int bufferTarget, int warmupTicks) {
             if (group.members.isEmpty())
                 return;
 
-            for (Binding b : group.members) {
-                b.hasPendingFrame = false;
-                b.scheduledSendTick = -1L;
-                b.renderer.clearStagedOnly();
-                b.renderer.resetSeen();
-            }
+            resetRenderers();
+
+            this.liveMode = false;
+            this.liveUrl = null;
+            this.liveQueueLimit = DEFAULT_LIVE_QUEUE_LIMIT;
 
             this.ticksPerFrame = (tpf < 0) ? -1 : Math.max(1, tpf);
             this.loop = loop;
@@ -977,6 +1075,7 @@ class BindManager {
             startPreloaderAsync();
             dbg("screen " + id + " startPlayback frames=" + frames.size()
                     + " video=" + videoMode
+                    + " live=" + liveMode
                     + " tpf=" + this.ticksPerFrame
                     + " loop=" + this.loop
                     + " warmupTicks=" + this.warmupTicks);
@@ -986,17 +1085,19 @@ class BindManager {
             stopPreloader();
             buffer.clear();
 
-            for (Binding b : group.members) {
-                b.hasPendingFrame = false;
-                b.scheduledSendTick = -1L;
-                b.renderer.clearStagedOnly();
-                b.renderer.resetSeen();
-            }
+            resetRenderers();
 
             frames = Collections.emptyList();
             frameIndex = 0;
             ticksPerFrame = 1;
             nextFrameTick = Long.MAX_VALUE;
+            videoMode = false;
+            videoFile = null;
+            liveMode = false;
+            liveUrl = null;
+            loop = false;
+            warmupTicks = 0;
+            liveQueueLimit = DEFAULT_LIVE_QUEUE_LIMIT;
         }
 
         void resetToBlack() {
@@ -1064,16 +1165,32 @@ class BindManager {
         }
 
         private String describeBase() {
-            String framesInfo = videoMode
-                    ? ("<video:" + (videoFile != null ? videoFile.getName() : "?") + ">")
-                    : String.valueOf(frames.size());
-            String playback = videoMode
-                    ? ""
-                    : (frames.isEmpty() ? "" : (" idx=" + frameIndex + "/" + Math.max(0, frames.size() - 1)));
+            String modeInfo;
+            if (liveMode)
+                modeInfo = "<live>";
+            else if (videoMode)
+                modeInfo = "<video:" + (videoFile != null ? videoFile.getName() : "?") + ">";
+            else
+                modeInfo = String.valueOf(frames.size());
+
+            String playback = (!liveMode && !videoMode && !frames.isEmpty())
+                    ? " idx=" + frameIndex + "/" + Math.max(0, frames.size() - 1)
+                    : "";
+
+            String tpfInfo;
+            if (ticksPerFrame == -1)
+                tpfInfo = " tpf=-1";
+            else if (ticksPerFrame == 0)
+                tpfInfo = " tpf=source";
+            else
+                tpfInfo = " tpf=" + ticksPerFrame;
+
+            String loopInfo = liveMode ? "" : " loop=" + loop;
+
             return "binding=" + group.members.size() + " maps layout=" + group.cols + "x" + group.rows
-                    + " frames=" + framesInfo
-                    + (ticksPerFrame == -1 ? " tpf=-1" : " tpf=" + ticksPerFrame)
-                    + " loop=" + loop
+                    + " frames=" + modeInfo
+                    + tpfInfo
+                    + loopInfo
                     + playback
                     + " radius=" + maxDistance
                     + (sourceLabel.isEmpty() ? "" : (" source=" + sourceLabel));
@@ -1091,9 +1208,23 @@ class BindManager {
             publishFrame(linear);
         }
 
+        private void resetRenderers() {
+            for (Binding b : group.members) {
+                b.hasPendingFrame = false;
+                b.scheduledSendTick = -1L;
+                b.renderer.clearStagedOnly();
+                b.renderer.resetSeen();
+            }
+        }
+
         private void startPreloaderAsync() {
             stopPreloader();
             preloadRunning = true;
+
+            if (liveMode && liveUrl != null) {
+                ffmpegTask = Bukkit.getScheduler().runTaskAsynchronously(plugin, this::runFfmpegLive);
+                return;
+            }
 
             if (videoMode && videoFile != null) {
                 ffmpegTask = Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
@@ -1169,9 +1300,6 @@ class BindManager {
         }
 
         private void runFfmpegOnce() {
-            int tpfLocal = (this.ticksPerFrame <= 0) ? 1 : this.ticksPerFrame;
-            double fps = 20.0 / tpfLocal;
-
             final int W = expectedWidth();
             final int H = expectedHeight();
             final int RGB_BYTES = W * H * 3;
@@ -1181,8 +1309,7 @@ class BindManager {
                     "-hide_banner", "-loglevel", "error", "-nostdin",
                     "-re",
                     "-i", videoFile.getAbsolutePath(),
-                    "-vf", "scale=" + W + ":" + H + ":flags=neighbor",
-                    "-r", String.format(Locale.US, "%.6f", fps),
+                    "-vf", scaleFilter(W, H),
                     "-pix_fmt", "rgb24",
                     "-f", "rawvideo", "pipe:1");
 
@@ -1223,6 +1350,86 @@ class BindManager {
                 }
                 ffmpegProc = null;
             }
+        }
+
+        private void runFfmpegLive() {
+            final int W = expectedWidth();
+            final int H = expectedHeight();
+            final int RGB_BYTES = W * H * 3;
+
+            while (preloadRunning) {
+                List<String> cmd = new ArrayList<>();
+                cmd.addAll(Arrays.asList(
+                        "ffmpeg",
+                        "-hide_banner", "-loglevel", "error", "-nostdin",
+                        "-fflags", "nobuffer",
+                        "-flags", "low_delay",
+                        "-analyzeduration", "1000000",
+                        "-probesize", "1000000",
+                        "-i", liveUrl,
+                        "-vf", scaleFilter(W, H),
+                        "-pix_fmt", "rgb24",
+                        "-f", "rawvideo", "pipe:1"));
+
+                ProcessBuilder pb = new ProcessBuilder(cmd);
+                pb.redirectErrorStream(true);
+                try {
+                    ffmpegProc = pb.start();
+                } catch (IOException e) {
+                    plugin.getLogger().warning(
+                            "[mplay] screen " + id + " live ffmpeg launch failed: " + e.getMessage());
+                    sleepSilently(1000);
+                    continue;
+                }
+
+                try (InputStream in = new BufferedInputStream(ffmpegProc.getInputStream(), RGB_BYTES * 2)) {
+                    byte[] rgb = new byte[RGB_BYTES];
+                    while (preloadRunning) {
+                        if (bufferTarget > 0 && buffer.size() >= bufferTarget) {
+                            sleepSilently(5);
+                            continue;
+                        }
+                        int off = 0, n;
+                        while (off < RGB_BYTES && (n = in.read(rgb, off, RGB_BYTES - off)) > 0)
+                            off += n;
+                        if (off < RGB_BYTES)
+                            break;
+                        byte[] linear = frameSourceLoader.rgb24ToPalette(rgb, W, H, lut);
+                        buffer.offer(linear);
+                        if (liveMode && liveQueueLimit > 0) {
+                            while (buffer.size() > liveQueueLimit)
+                                buffer.poll();
+                        }
+                    }
+                } catch (IOException io) {
+                    plugin.getLogger().warning(
+                            "[mplay] screen " + id + " live read error: " + io.getMessage());
+                } finally {
+                    try {
+                        if (ffmpegProc != null)
+                            ffmpegProc.destroy();
+                    } catch (Throwable ignore) {
+                    }
+                    ffmpegProc = null;
+                }
+
+                if (!preloadRunning)
+                    break;
+                sleepSilently(1000);
+            }
+        }
+
+        private void sleepSilently(long millis) {
+            try {
+                Thread.sleep(millis);
+            } catch (InterruptedException ignored) {
+            }
+        }
+
+        private String scaleFilter(int width, int height) {
+            return String.format(Locale.US,
+                    "scale=%d:%d:flags=neighbor:force_original_aspect_ratio=disable,setsar=1",
+                    width, height);
         }
 
         private boolean hasAnyPending() {

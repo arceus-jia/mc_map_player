@@ -270,6 +270,30 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     }
                     return true;
                 }
+                case "live": {
+                    TargetParseResult target = parseOptionalScreenId(a, 1);
+                    int idx = target.nextIndex;
+                    Integer screenId = target.screenId != null ? target.screenId : binds.lastActiveId();
+                    if (screenId == null) {
+                        s.sendMessage(color("&cNo screen selected."));
+                        return true;
+                    }
+                    if (idx >= a.length) {
+                        s.sendMessage(color(
+                                "&f/mplay live [id <screenId>] <m3u8OrName> [ticksPerFrame] [bufferFrames]"));
+                        return true;
+                    }
+                    String source = a[idx++];
+                    Integer tpf = null;
+                    Integer bufferFrames = null;
+                    if (idx < a.length)
+                        tpf = Integer.parseInt(a[idx++]);
+                    if (idx < a.length)
+                        bufferFrames = Integer.parseInt(a[idx++]);
+                    binds.startLiveStream(screenId, source, tpf != null ? tpf : 0,
+                            bufferFrames, s);
+                    return true;
+                }
                 case "bilibili": {
                     if (a.length < 3) {
                         s.sendMessage(color("&f/mplay bilibili <name> <roomId>"));
@@ -339,6 +363,8 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         s.sendMessage(color("&f/mplay reset [id <screenId>]"));
         s.sendMessage(color("&f/mplay download <name> <url>"));
         s.sendMessage(color("&f/mplay bilibili <name> <roomId>"));
+        s.sendMessage(color(
+                "&f/mplay live [id <screenId>] <m3u8OrName> [ticksPerFrame] [bufferFrames]"));
         s.sendMessage(color("&f/mplay media"));
         s.sendMessage(color(
                 "&7Frames: .json (HxW int), .smrf (raw W*H bytes), .png/.jpg (RGB via LUT), or a single video file (ffmpeg)."));
