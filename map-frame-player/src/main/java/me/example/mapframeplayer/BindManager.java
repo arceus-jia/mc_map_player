@@ -2,6 +2,10 @@ package me.example.mapframeplayer;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.google.gson.reflect.TypeToken;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -23,12 +27,15 @@ import org.bukkit.scheduler.BukkitTask;
 
 import java.awt.Color;
 import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.Reader;
 import java.lang.reflect.Type;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -109,21 +116,25 @@ class BindManager {
     void downloadMedia(String name, String url, CommandSender feedback) {
         String safeName = sanitizeName(name);
         if (safeName.isEmpty()) {
-            feedback.sendMessage("[mplay] Name is empty after sanitizing.");
+            sendFeedback(feedback, "Name is empty after sanitizing.");
             return;
         }
         if (!safeName.equals(name)) {
-            feedback.sendMessage("[mplay] Name adjusted to " + safeName + " for safety.");
+            sendFeedback(feedback, "Name adjusted to " + safeName + " for safety.");
         }
 
         File framesRoot = new File(plugin.getDataFolder(), "frames");
         if (!framesRoot.exists() && !framesRoot.mkdirs()) {
-            feedback.sendMessage("[mplay] Failed to create frames directory.");
+            sendFeedback(feedback, "Failed to create frames directory.");
             return;
         }
         File targetDir = new File(framesRoot, safeName);
         if (!targetDir.exists() && !targetDir.mkdirs()) {
-            feedback.sendMessage("[mplay] Failed to create directory: " + targetDir.getAbsolutePath());
+            sendFeedback(feedback, "Failed to create directory: " + targetDir.getAbsolutePath());
+            return;
+        }
+        if (hasExistingMedia(targetDir)) {
+            sendFeedback(feedback, "Media '" + safeName + "' already exists. Choose a different name or remove it first.");
             return;
         }
 
@@ -131,7 +142,7 @@ class BindManager {
             try {
                 downloadToFolder(url, targetDir, feedback);
             } catch (IOException e) {
-                feedback.sendMessage("[mplay] Download failed: " + e.getMessage());
+                sendFeedback(feedback, "Download failed: " + e.getMessage());
             }
         });
     }
@@ -158,7 +169,7 @@ class BindManager {
     }
 
     private void downloadToFolder(String url, File targetDir, CommandSender feedback) throws IOException {
-        feedback.sendMessage("[mplay] Starting download...");
+        sendFeedback(feedback, "Starting download...");
         java.net.URL remote = new java.net.URL(url);
         java.net.URLConnection conn = remote.openConnection();
         conn.setRequestProperty("User-Agent", "MapFramePlayer/1.0");
@@ -175,7 +186,7 @@ class BindManager {
                 out.write(buf, 0, read);
                 total += read;
             }
-            feedback.sendMessage("[mplay] Downloaded " + humanReadableBytes(total) + " to " + targetFile.getName());
+            sendFeedback(feedback, "Downloaded " + humanReadableBytes(total) + " to " + targetFile.getName());
         }
     }
 
@@ -218,6 +229,125 @@ class BindManager {
 
     private String sanitizeName(String raw) {
         return raw == null ? "" : raw.replaceAll("[^A-Za-z0-9_-]", "_");
+    }
+
+    void fetchBilibiliStream(String name, String roomId, CommandSender feedback) {
+        String safeName = sanitizeName(name);
+        if (safeName.isEmpty()) {
+            sendFeedback(feedback, "Name is empty after sanitizing.");
+            return;
+        }
+        if (!safeName.equals(name))
+            sendFeedback(feedback, "Name adjusted to " + safeName + " for safety.");
+
+        File framesRoot = new File(plugin.getDataFolder(), "frames");
+        if (!framesRoot.exists() && !framesRoot.mkdirs()) {
+            sendFeedback(feedback, "Failed to create frames directory.");
+            return;
+        }
+        File targetDir = new File(framesRoot, safeName);
+        if (!targetDir.exists() && !targetDir.mkdirs()) {
+            sendFeedback(feedback, "Failed to create directory: " + targetDir.getAbsolutePath());
+            return;
+        }
+        if (hasExistingMedia(targetDir)) {
+            sendFeedback(feedback, "Media '" + safeName + "' already exists. Choose a different name or remove it first.");
+            return;
+        }
+
+        sendFeedback(feedback, "Resolving bilibili live for room " + roomId + "...");
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                String streamUrl = resolveBilibiliM3U8(roomId);
+                File targetFile = new File(targetDir, "bilibili.m3u8.txt");
+                try (FileOutputStream out = new FileOutputStream(targetFile)) {
+                    out.write(streamUrl.getBytes(StandardCharsets.UTF_8));
+                    out.write('\n');
+                }
+                sendFeedback(feedback, "Saved bilibili stream URL to " + targetFile.getName());
+            } catch (IOException e) {
+                sendFeedback(feedback, "Bilibili resolve failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private boolean hasExistingMedia(File dir) {
+        File[] files = dir.listFiles();
+        return files != null && files.length > 0;
+    }
+
+    private void sendFeedback(CommandSender receiver, String message) {
+        if (receiver == null)
+            return;
+        Bukkit.getScheduler().runTask(plugin, () -> receiver.sendMessage("[mplay] " + message));
+    }
+
+    private String resolveBilibiliM3U8(String roomId) throws IOException {
+        String api = "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id=" + roomId
+                + "&protocol=0,1&format=0,1,2&codec=0,1&qn=0&platform=web&ptype=8";
+        HttpURLConnection conn = (HttpURLConnection) new URL(api).openConnection();
+        conn.setConnectTimeout(5000);
+        conn.setReadTimeout(7000);
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (MapFramePlayer)");
+        conn.setRequestProperty("Referer", "https://live.bilibili.com/" + roomId);
+
+        int http = conn.getResponseCode();
+        if (http != HttpURLConnection.HTTP_OK)
+            throw new IOException("HTTP " + http + " while requesting bilibili API");
+
+        String body;
+        try (InputStream in = conn.getInputStream();
+                ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[8192];
+            int len;
+            while ((len = in.read(buf)) != -1)
+                out.write(buf, 0, len);
+            body = out.toString(StandardCharsets.UTF_8.name());
+        }
+
+        JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+        if (!root.has("code") || root.get("code").getAsInt() != 0)
+            throw new IOException("API response error: " + root.get("code"));
+        JsonObject data = root.getAsJsonObject("data");
+        if (data == null)
+            throw new IOException("Missing data field");
+        JsonObject playurlInfo = data.getAsJsonObject("playurl_info");
+        if (playurlInfo == null)
+            throw new IOException("Missing playurl_info field");
+        JsonObject playurl = playurlInfo.getAsJsonObject("playurl");
+        if (playurl == null)
+            throw new IOException("Missing playurl field");
+
+        JsonArray streams = playurl.getAsJsonArray("stream");
+        if (streams == null || streams.size() == 0)
+            throw new IOException("No available stream data");
+
+        for (JsonElement streamElem : streams) {
+            JsonObject stream = streamElem.getAsJsonObject();
+            JsonArray formats = stream.getAsJsonArray("format");
+            if (formats == null)
+                continue;
+            for (JsonElement formatElem : formats) {
+                JsonObject format = formatElem.getAsJsonObject();
+                JsonArray codecs = format.getAsJsonArray("codec");
+                if (codecs == null)
+                    continue;
+                for (JsonElement codecElem : codecs) {
+                    JsonObject codec = codecElem.getAsJsonObject();
+                    String baseUrl = codec.has("base_url") ? codec.get("base_url").getAsString() : null;
+                    JsonArray urlInfos = codec.getAsJsonArray("url_info");
+                    if (baseUrl == null || urlInfos == null || urlInfos.size() == 0)
+                        continue;
+                    JsonObject info = urlInfos.get(0).getAsJsonObject();
+                    String host = info.get("host").getAsString();
+                    String extra = info.has("extra") ? info.get("extra").getAsString() : "";
+                    if (host != null)
+                        return host + baseUrl + extra;
+                }
+            }
+        }
+
+        throw new IOException("Unable to locate a playable URL");
     }
 
     void stop() {

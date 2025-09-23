@@ -13,6 +13,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.util.List;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -269,6 +270,16 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     }
                     return true;
                 }
+                case "bilibili": {
+                    if (a.length < 3) {
+                        s.sendMessage(color("&f/mplay bilibili <name> <roomId>"));
+                        return true;
+                    }
+                    String name = a[1];
+                    String roomId = a[2];
+                    binds.fetchBilibiliStream(name, roomId, s);
+                    return true;
+                }
                 case "clear": {
                     if (a.length >= 2 && a[1].equalsIgnoreCase("all")) {
                         int cleared = binds.clearAllScreens();
@@ -327,6 +338,7 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         s.sendMessage(color("&f/mplay clear [id <screenId>|all]"));
         s.sendMessage(color("&f/mplay reset [id <screenId>]"));
         s.sendMessage(color("&f/mplay download <name> <url>"));
+        s.sendMessage(color("&f/mplay bilibili <name> <roomId>"));
         s.sendMessage(color("&f/mplay media"));
         s.sendMessage(color(
                 "&7Frames: .json (HxW int), .smrf (raw W*H bytes), .png/.jpg (RGB via LUT), or a single video file (ffmpeg)."));
