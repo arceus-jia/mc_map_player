@@ -2,11 +2,6 @@ package me.example.mapframeplayer;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import com.google.gson.JsonPrimitive;
 import com.google.gson.reflect.TypeToken;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -17,6 +12,7 @@ import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.ItemFrame;
 import org.bukkit.entity.Player;
+import org.bukkit.command.CommandSender;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.MapMeta;
 import org.bukkit.map.MapPalette;
@@ -25,17 +21,12 @@ import org.bukkit.map.MapView;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
-import javax.imageio.ImageIO;
 import java.awt.Color;
-import java.awt.Graphics2D;
-import java.awt.RenderingHints;
-import java.awt.image.BufferedImage;
 import java.io.BufferedInputStream;
 import java.io.File;
-import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.Reader;
 import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
@@ -56,6 +47,7 @@ class BindManager {
 
     private final JavaPlugin plugin;
     private final PlayerManager playerManager;
+    private final FrameSourceLoader frameSourceLoader;
 
     private final Map<Integer, ScreenSession> sessions = new LinkedHashMap<>();
     private int nextScreenId = 1;
@@ -72,6 +64,7 @@ class BindManager {
     BindManager(JavaPlugin plugin, PlayerManager playerManager) {
         this.plugin = plugin;
         this.playerManager = playerManager;
+        this.frameSourceLoader = new FrameSourceLoader(plugin);
     }
 
     void loadPersistedScreens() {
@@ -111,6 +104,120 @@ class BindManager {
                 session.onTick(MapFramePlayer.TICK);
             }
         }, 1L, 1L);
+    }
+
+    void downloadMedia(String name, String url, CommandSender feedback) {
+        String safeName = sanitizeName(name);
+        if (safeName.isEmpty()) {
+            feedback.sendMessage("[mplay] Name is empty after sanitizing.");
+            return;
+        }
+        if (!safeName.equals(name)) {
+            feedback.sendMessage("[mplay] Name adjusted to " + safeName + " for safety.");
+        }
+
+        File framesRoot = new File(plugin.getDataFolder(), "frames");
+        if (!framesRoot.exists() && !framesRoot.mkdirs()) {
+            feedback.sendMessage("[mplay] Failed to create frames directory.");
+            return;
+        }
+        File targetDir = new File(framesRoot, safeName);
+        if (!targetDir.exists() && !targetDir.mkdirs()) {
+            feedback.sendMessage("[mplay] Failed to create directory: " + targetDir.getAbsolutePath());
+            return;
+        }
+
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                downloadToFolder(url, targetDir, feedback);
+            } catch (IOException e) {
+                feedback.sendMessage("[mplay] Download failed: " + e.getMessage());
+            }
+        });
+    }
+
+    List<String> listMediaEntries() {
+        File framesRoot = new File(plugin.getDataFolder(), "frames");
+        if (!framesRoot.exists() || !framesRoot.isDirectory())
+            return Collections.emptyList();
+        File[] dirs = framesRoot.listFiles();
+        if (dirs == null)
+            return Collections.emptyList();
+        Arrays.sort(dirs, Comparator.comparing(File::getName));
+        List<String> result = new ArrayList<>();
+        for (File f : dirs) {
+            if (f.isDirectory()) {
+                File[] children = f.listFiles();
+                int count = children == null ? 0 : children.length;
+                result.add(f.getName() + " (" + count + " file" + (count == 1 ? "" : "s") + ")");
+            } else {
+                result.add(f.getName());
+            }
+        }
+        return result;
+    }
+
+    private void downloadToFolder(String url, File targetDir, CommandSender feedback) throws IOException {
+        feedback.sendMessage("[mplay] Starting download...");
+        java.net.URL remote = new java.net.URL(url);
+        java.net.URLConnection conn = remote.openConnection();
+        conn.setRequestProperty("User-Agent", "MapFramePlayer/1.0");
+        String path = remote.getPath();
+        String ext = determineExtension(path, conn.getContentType());
+        File targetFile = new File(targetDir, "default" + ext);
+
+        try (InputStream in = conn.getInputStream();
+             java.io.FileOutputStream out = new java.io.FileOutputStream(targetFile)) {
+            byte[] buf = new byte[8192];
+            int read;
+            long total = 0;
+            while ((read = in.read(buf)) != -1) {
+                out.write(buf, 0, read);
+                total += read;
+            }
+            feedback.sendMessage("[mplay] Downloaded " + humanReadableBytes(total) + " to " + targetFile.getName());
+        }
+    }
+
+    private String determineExtension(String path, String contentType) {
+        String ext = extractExtension(path);
+        if (ext != null)
+            return ext;
+        if (contentType != null) {
+            if (contentType.contains("json"))
+                return ".json";
+            if (contentType.contains("smrf"))
+                return ".smrf";
+            if (contentType.contains("png"))
+                return ".png";
+            if (contentType.contains("jpeg") || contentType.contains("jpg"))
+                return ".jpg";
+        }
+        return ".mp4";
+    }
+
+    private String extractExtension(String path) {
+        int dot = path.lastIndexOf('.');
+        if (dot <= 0 || dot == path.length() - 1)
+            return null;
+        String candidate = path.substring(dot).toLowerCase(Locale.ROOT);
+        if (candidate.length() > 5)
+            return null;
+        if (candidate.matches("\\.[a-z0-9]{1,4}"))
+            return candidate;
+        return null;
+    }
+
+    private String humanReadableBytes(long bytes) {
+        if (bytes < 1024)
+            return bytes + " B";
+        int exp = (int) (Math.log(bytes) / Math.log(1024));
+        String pre = ("KMGTPE").charAt(exp - 1) + "";
+        return String.format(Locale.US, "%.1f %sB", bytes / Math.pow(1024, exp), pre);
+    }
+
+    private String sanitizeName(String raw) {
+        return raw == null ? "" : raw.replaceAll("[^A-Za-z0-9_-]", "_");
     }
 
     void stop() {
@@ -608,7 +715,7 @@ class BindManager {
                         if (!videoMode && !frames.isEmpty()) {
                             try {
                                 File f0 = frames.get(0);
-                                linear = readFrameLinear(f0);
+                                linear = frameSourceLoader.readFrameLinear(f0, expectedWidth(), expectedHeight(), lut);
                             } catch (IOException e) {
                                 plugin.getLogger().warning("[mplay] single-frame read failed: " + e.getMessage());
                                 return;
@@ -695,101 +802,24 @@ class BindManager {
                 plugin.getLogger().warning("No binding for screen " + id + ". Use /mplay set/create first.");
                 return 0;
             }
-            File folder = new File(plugin.getDataFolder(), "frames/" + folderPath);
-
-            plugin.getLogger().info("[mplay] screen " + id + " loading frames from: " + folder.getAbsolutePath());
-            if (!folder.exists()) {
-                plugin.getLogger().warning("Folder does not exist: " + folder.getAbsolutePath());
-                return 0;
-            }
-            if (!folder.isDirectory()) {
-                plugin.getLogger().warning("Path is not a directory: " + folder.getAbsolutePath());
-                return 0;
-            }
-
-            File[] files = folder.listFiles((dir, name) -> {
-                String n = name.toLowerCase(Locale.ROOT);
-                return n.endsWith(".json") || n.endsWith(".smrf") || n.endsWith(".png") || n.endsWith(".jpg")
-                        || n.endsWith(".jpeg") || isVideoName(n);
-            });
-            if (files == null || files.length == 0) {
-                plugin.getLogger().warning("No frame files found in: " + folder.getAbsolutePath());
-                return 0;
-            }
-
-            if (files.length == 1 && isVideoFile(files[0])) {
-                videoMode = true;
-                videoFile = files[0];
-                frames = Collections.emptyList();
-                frameIndex = 0;
-                plugin.getLogger().info("[mplay] screen " + id + " video mode: " + videoFile.getName());
-                this.sourceLabel = folderPath + "/" + videoFile.getName();
-                saveSessions();
-                return 1;
-            }
-
-            List<File> list = new ArrayList<>();
-            for (File f : files)
-                if (!isVideoFile(f))
-                    list.add(f);
-            File[] frameFiles = list.toArray(new File[0]);
-
-            Arrays.sort(frameFiles, (a, b) -> {
-                String sa = a.getName();
-                String sb = b.getName();
-                String ra = sa.replaceAll("\\D+", "");
-                String rb = sb.replaceAll("\\D+", "");
-                if (!ra.isEmpty() && !rb.isEmpty()) {
-                    try {
-                        int ia = Integer.parseInt(ra);
-                        int ib = Integer.parseInt(rb);
-                        return Integer.compare(ia, ib);
-                    } catch (NumberFormatException ignore) {
-                    }
-                }
-                return sa.compareTo(sb);
-            });
-
-            plugin.getLogger().info("Found " + frameFiles.length + " frame(s). First = " + frameFiles[0].getName());
-
             try {
-                File f0 = frameFiles[0];
-                if (isJsonFile(f0)) {
-                    int[] wh = peekJsonSize(f0);
-                    int w = wh[0], h = wh[1];
-                    if (w != expectedWidth() || h != expectedHeight()) {
-                        plugin.getLogger().warning("JSON frame size mismatch.");
-                        return 0;
-                    }
-                } else if (isSmrfFile(f0)) {
-                    long len = f0.length();
-                    if (len != expectedBytes()) {
-                        plugin.getLogger().warning("SMRF length mismatch.");
-                        return 0;
-                    }
-                } else if (isImageFile(f0)) {
-                    BufferedImage img0 = ImageIO.read(f0);
-                    if (img0 == null) {
-                        plugin.getLogger().warning("Image read failed: " + f0.getName());
-                        return 0;
-                    }
-                } else {
-                    plugin.getLogger().warning("Unknown frame type: " + f0.getName());
-                    return 0;
-                }
+                FrameSourceLoader.FrameLoadResult result = frameSourceLoader.loadFromFolder(
+                        plugin.getDataFolder(),
+                        folderPath,
+                        expectedWidth(),
+                        expectedHeight(),
+                        lut);
+                this.videoMode = result.videoMode;
+                this.videoFile = result.videoFile;
+                this.frames = result.frameFiles;
+                this.frameIndex = 0;
+                this.sourceLabel = result.sourceLabel != null ? result.sourceLabel : folderPath;
+                saveSessions();
+                return result.frameCount;
             } catch (IOException e) {
-                plugin.getLogger().warning("Read first frame failed: " + e.getMessage());
+                plugin.getLogger().warning("[mplay] screen " + id + " load failed: " + e.getMessage());
                 return 0;
             }
-
-            videoMode = false;
-            videoFile = null;
-            frames = Arrays.asList(frameFiles);
-            frameIndex = 0;
-            plugin.getLogger().info("Frames loaded successfully: " + frames.size());
-            this.sourceLabel = folderPath;
-            saveSessions();
-            return frames.size();
         }
 
         void startPlayback(int tpf, boolean loop, int bufferTarget, int warmupTicks) {
@@ -970,7 +1000,7 @@ class BindManager {
                         }
                         File f = snap.get(idx);
                         try {
-                            byte[] linear = readFrameLinear(f);
+                            byte[] linear = frameSourceLoader.readFrameLinear(f, expectedWidth(), expectedHeight(), lut);
                             buffer.offer(linear);
                         } catch (IOException e) {
                             plugin.getLogger().warning("preload failed: " + f.getName() + " -> " + e.getMessage());
@@ -1050,7 +1080,7 @@ class BindManager {
                         off += n;
                     if (off < RGB_BYTES)
                         break;
-                    byte[] linear = rgb24ToPalette(rgb, W, H);
+                    byte[] linear = frameSourceLoader.rgb24ToPalette(rgb, W, H, lut);
                     buffer.offer(linear);
                 }
             } catch (IOException io) {
@@ -1097,248 +1127,6 @@ class BindManager {
 
         private int expectedBytes() {
             return expectedWidth() * expectedHeight();
-        }
-
-        private int[] peekJsonSize(File file) throws IOException {
-            try (Reader r = new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)) {
-                JsonArray arr = JsonParser.parseReader(r).getAsJsonArray();
-                int h = arr.size();
-                if (h == 0)
-                    throw new IOException("empty array");
-                int w = arr.get(0).getAsJsonArray().size();
-                return new int[] { w, h };
-            }
-        }
-
-        private byte[] readJsonLinear(File file) throws IOException {
-            try (Reader r = new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)) {
-                JsonArray arr = JsonParser.parseReader(r).getAsJsonArray();
-                int h = arr.size();
-                if (h == 0)
-                    throw new IOException("empty array");
-                JsonElement firstRowElem = arr.get(0);
-                if (!firstRowElem.isJsonArray())
-                    throw new IOException("row[0] is not an array");
-                JsonArray row0 = firstRowElem.getAsJsonArray();
-                int w = row0.size();
-                if (w != expectedWidth() || h != expectedHeight()) {
-                    throw new IOException("frame size mismatch: " + w + "x" + h);
-                }
-                byte[] out = new byte[w * h];
-                int pos = 0;
-                for (int y = 0; y < h; y++) {
-                    JsonElement rowElem = arr.get(y);
-                    if (!rowElem.isJsonArray())
-                        throw new IOException("row@" + y + " is not an array");
-                    JsonArray row = rowElem.getAsJsonArray();
-                    if (row.size() != w)
-                        throw new IOException("bad row width @y=" + y);
-                    for (int x = 0; x < w; x++) {
-                        out[pos++] = resolvePixel(row.get(x));
-                    }
-                }
-                return out;
-            } catch (IllegalStateException ex) {
-                throw new IOException("invalid json frame: " + ex.getMessage(), ex);
-            }
-        }
-
-        private byte[] readSmrfLinear(File file) throws IOException {
-            int need = expectedBytes();
-            try (InputStream in = new BufferedInputStream(new FileInputStream(file))) {
-                byte[] buf = in.readNBytes(need);
-                if (buf.length != need) {
-                    throw new IOException("smrf length mismatch: got=" + buf.length + " need=" + need);
-                }
-                return buf;
-            }
-        }
-
-        private byte resolvePixel(JsonElement elem) throws IOException {
-            if (elem == null || elem.isJsonNull())
-                return 0;
-            if (elem.isJsonPrimitive())
-                return primitiveToByte(elem.getAsJsonPrimitive());
-            if (elem.isJsonArray())
-                return arrayToByte(elem.getAsJsonArray());
-            if (elem.isJsonObject())
-                return objectToByte(elem.getAsJsonObject());
-            throw new IOException("unsupported json pixel element: " + elem);
-        }
-
-        private byte primitiveToByte(JsonPrimitive prim) throws IOException {
-            if (prim.isNumber())
-                return (byte) (prim.getAsInt() & 0xFF);
-            if (prim.isString()) {
-                try {
-                    return (byte) (Integer.parseInt(prim.getAsString().trim()) & 0xFF);
-                } catch (NumberFormatException ex) {
-                    throw new IOException("invalid numeric string: " + prim.getAsString(), ex);
-                }
-            }
-            throw new IOException("unsupported primitive: " + prim);
-        }
-
-        private byte arrayToByte(JsonArray arr) throws IOException {
-            if (arr.size() == 0)
-                return 0;
-            if (arr.size() == 1)
-                return resolvePixel(arr.get(0));
-            if (arr.size() >= 3)
-                return rgbToPalette(arr);
-            return resolvePixel(arr.get(0));
-        }
-
-        private byte objectToByte(JsonObject obj) throws IOException {
-            if (obj.has("index"))
-                return resolvePixel(obj.get("index"));
-            if (obj.has("value"))
-                return resolvePixel(obj.get("value"));
-            if (obj.has("palette"))
-                return resolvePixel(obj.get("palette"));
-            if (obj.has("rgb")) {
-                JsonElement rgb = obj.get("rgb");
-                if (rgb.isJsonArray())
-                    return rgbToPalette(rgb.getAsJsonArray());
-            }
-            if (obj.has("r") && obj.has("g") && obj.has("b")) {
-                return rgbToPalette(
-                        channelValue(obj.get("r")),
-                        channelValue(obj.get("g")),
-                        channelValue(obj.get("b")));
-            }
-            throw new IOException("unsupported pixel object keys: " + obj.keySet());
-        }
-
-        private byte rgbToPalette(JsonArray arr) throws IOException {
-            if (arr.size() < 3)
-                throw new IOException("rgb array must have >=3 elements");
-            int r = channelValue(arr.get(0));
-            int g = channelValue(arr.get(1));
-            int b = channelValue(arr.get(2));
-            return rgbToPalette(r, g, b);
-        }
-
-        private byte rgbToPalette(int r, int g, int b) throws IOException {
-            if (lut == null)
-                throw new IOException("LUT not loaded; cannot convert RGB");
-            int key = ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
-            return lut[key];
-        }
-
-        private int channelValue(JsonElement elem) throws IOException {
-            if (elem.isJsonPrimitive()) {
-                JsonPrimitive prim = elem.getAsJsonPrimitive();
-                if (prim.isNumber())
-                    return clampChannel(prim.getAsInt());
-                if (prim.isString()) {
-                    try {
-                        return clampChannel(Integer.parseInt(prim.getAsString().trim()));
-                    } catch (NumberFormatException ex) {
-                        throw new IOException("invalid channel string: " + prim.getAsString(), ex);
-                    }
-                }
-            }
-            throw new IOException("invalid rgb channel element: " + elem);
-        }
-
-        private int clampChannel(int v) {
-            if (v < 0)
-                return 0;
-            if (v > 255)
-                return 255;
-            return v;
-        }
-
-        private byte[] readFrameLinear(File file) throws IOException {
-            if (isJsonFile(file))
-                return readJsonLinear(file);
-            if (isSmrfFile(file))
-                return readSmrfLinear(file);
-            if (isImageFile(file))
-                return readImageLinear(file);
-            throw new IOException("unsupported frame type: " + file.getName());
-        }
-
-        private byte[] readImageLinear(File file) throws IOException {
-            if (lut == null) {
-                throw new IOException("LUT not loaded; put colormap.lut under plugins/MapFramePlayer/");
-            }
-            BufferedImage img = ImageIO.read(file);
-            if (img == null) {
-                throw new IOException("ImageIO.read returned null for " + file.getName());
-            }
-            final int W = expectedWidth();
-            final int H = expectedHeight();
-            BufferedImage scaled = (img.getWidth() == W && img.getHeight() == H)
-                    ? img
-                    : resizeImage(img, W, H);
-
-            int[] rgb = scaled.getRGB(0, 0, W, H, null, 0, W);
-            byte[] out = new byte[W * H];
-            for (int i = 0; i < rgb.length; i++) {
-                int p = rgb[i];
-                int r = (p >>> 16) & 0xFF;
-                int g = (p >>> 8) & 0xFF;
-                int b = p & 0xFF;
-                int key = (r << 16) | (g << 8) | b;
-                out[i] = lut[key];
-            }
-            return out;
-        }
-
-        private byte[] rgb24ToPalette(byte[] rgb, int W, int H) {
-            if (lut == null)
-                throw new IllegalStateException("LUT not loaded");
-            byte[] out = new byte[W * H];
-            int p = 0;
-            for (int i = 0; i < out.length; i++) {
-                int r = rgb[p++] & 0xFF;
-                int g = rgb[p++] & 0xFF;
-                int b = rgb[p++] & 0xFF;
-                int key = (r << 16) | (g << 8) | b;
-                out[i] = lut[key];
-            }
-            return out;
-        }
-
-        private boolean isJsonFile(File f) {
-            String n = f.getName().toLowerCase(Locale.ROOT);
-            return n.endsWith(".json");
-        }
-
-        private boolean isSmrfFile(File f) {
-            String n = f.getName().toLowerCase(Locale.ROOT);
-            return n.endsWith(".smrf");
-        }
-
-        private boolean isImageFile(File f) {
-            String n = f.getName().toLowerCase(Locale.ROOT);
-            return n.endsWith(".png") || n.endsWith(".jpg") || n.endsWith(".jpeg");
-        }
-
-        private boolean isVideoFile(File f) {
-            return isVideoName(f.getName().toLowerCase(Locale.ROOT));
-        }
-
-        private boolean isVideoName(String n) {
-            return n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".m4v")
-                    || n.endsWith(".avi") || n.endsWith(".webm") || n.endsWith(".wmv")
-                    || n.endsWith(".ts") || n.endsWith(".m3u8") || n.endsWith(".gif");
-        }
-
-        private BufferedImage resizeImage(BufferedImage src, int dstW, int dstH) {
-            BufferedImage dst = new BufferedImage(dstW, dstH, BufferedImage.TYPE_INT_RGB);
-            Graphics2D g2 = dst.createGraphics();
-            try {
-                g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-                g2.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
-                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                g2.drawImage(src, 0, 0, dstW, dstH, null);
-            } finally {
-                g2.dispose();
-            }
-            return dst;
         }
 
         private byte[] sliceTile(byte[] src, int bigW, int tileRow, int tileCol, boolean flipX) {

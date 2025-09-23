@@ -12,6 +12,7 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -247,6 +248,27 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         s.sendMessage(color("&f" + line));
                     return true;
                 }
+                case "download": {
+                    if (a.length < 3) {
+                        s.sendMessage(color("&f/mplay download <name> <url>"));
+                        return true;
+                    }
+                    String name = a[1];
+                    String url = a[2];
+                    binds.downloadMedia(name, url, s);
+                    return true;
+                }
+                case "media": {
+                    List<String> entries = binds.listMediaEntries();
+                    if (entries.isEmpty()) {
+                        s.sendMessage(color("&7No media found under frames/"));
+                    } else {
+                        s.sendMessage(color("&eAvailable media:"));
+                        for (String entry : entries)
+                            s.sendMessage(color("&f" + entry));
+                    }
+                    return true;
+                }
                 case "clear": {
                     if (a.length >= 2 && a[1].equalsIgnoreCase("all")) {
                         int cleared = binds.clearAllScreens();
@@ -304,6 +326,8 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         s.sendMessage(color("&f/mplay status [id <screenId>|all]"));
         s.sendMessage(color("&f/mplay clear [id <screenId>|all]"));
         s.sendMessage(color("&f/mplay reset [id <screenId>]"));
+        s.sendMessage(color("&f/mplay download <name> <url>"));
+        s.sendMessage(color("&f/mplay media"));
         s.sendMessage(color(
                 "&7Frames: .json (HxW int), .smrf (raw W*H bytes), .png/.jpg (RGB via LUT), or a single video file (ffmpeg)."));
 
