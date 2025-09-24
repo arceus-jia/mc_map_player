@@ -26,6 +26,8 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
 import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.image.BufferedImage;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -48,6 +50,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
+
+import javax.imageio.ImageIO;
 
 class BindManager {
     private final boolean DEBUG = true;
@@ -134,7 +138,8 @@ class BindManager {
             return;
         }
         if (hasExistingMedia(targetDir)) {
-            sendFeedback(feedback, "Media '" + safeName + "' already exists. Choose a different name or remove it first.");
+            sendFeedback(feedback,
+                    "Media '" + safeName + "' already exists. Choose a different name or remove it first.");
             return;
         }
 
@@ -189,7 +194,7 @@ class BindManager {
             label = source + "/bilibili";
         }
 
-        session.startLiveStream(url, label, requestedTpf, bufferFrames != null ? bufferFrames : 0);
+        session.startLiveStream(url, label, requestedTpf, bufferFrames != null ? bufferFrames : 0, feedback);
         saveSessions();
         sendFeedback(feedback, "Screen #" + screenId + " streaming from " + url);
     }
@@ -225,7 +230,7 @@ class BindManager {
         File targetFile = new File(targetDir, "default" + ext);
 
         try (InputStream in = conn.getInputStream();
-             java.io.FileOutputStream out = new java.io.FileOutputStream(targetFile)) {
+                java.io.FileOutputStream out = new java.io.FileOutputStream(targetFile)) {
             byte[] buf = new byte[8192];
             int read;
             long total = 0;
@@ -298,7 +303,8 @@ class BindManager {
             return;
         }
         if (hasExistingMedia(targetDir)) {
-            sendFeedback(feedback, "Media '" + safeName + "' already exists. Choose a different name or remove it first.");
+            sendFeedback(feedback,
+                    "Media '" + safeName + "' already exists. Choose a different name or remove it first.");
             return;
         }
 
@@ -831,6 +837,7 @@ class BindManager {
         double y;
         double z;
     }
+
     private class ScreenSession {
         final int id;
         final BindingGroup group;
@@ -849,6 +856,13 @@ class BindManager {
         private boolean liveMode = false;
         private String liveUrl = null;
         private int liveQueueLimit = DEFAULT_LIVE_QUEUE_LIMIT;
+        private boolean dumpedFirstFrame = false;
+        private boolean frameSizeWarningLogged = false;
+        private CommandSender liveStarter = null;
+        private BukkitTask progressTask = null;
+        private boolean firstFrameAnnounced = false;
+        private long liveStartNano = 0L;
+        private int liveConnectAttempts = 0;
 
         private List<File> frames = Collections.emptyList();
         private int frameIndex = 0;
@@ -1014,7 +1028,7 @@ class BindManager {
             }
         }
 
-        void startLiveStream(String url, String label, int requestedTpf, int bufferFrames) {
+        void startLiveStream(String url, String label, int requestedTpf, int bufferFrames, CommandSender starter) {
             if (group.members.isEmpty())
                 return;
 
@@ -1033,6 +1047,12 @@ class BindManager {
             this.bufferTarget = 0;
             this.warmupTicks = 0;
             this.liveQueueLimit = (bufferFrames > 0) ? bufferFrames : DEFAULT_LIVE_QUEUE_LIMIT;
+            this.frameSizeWarningLogged = false;
+            this.dumpedFirstFrame = false;
+            this.liveStarter = starter;
+            this.firstFrameAnnounced = false;
+            this.liveStartNano = System.nanoTime();
+            this.liveConnectAttempts = 0;
 
             if (requestedTpf < 0)
                 this.ticksPerFrame = -1;
@@ -1046,6 +1066,7 @@ class BindManager {
                     ? MapFramePlayer.TICK
                     : (startTick + this.ticksPerFrame);
 
+            startProgressNotifier();
             startPreloaderAsync();
             dbg("screen " + id + " startLiveStream url=" + url + " tpf=" + this.ticksPerFrame
                     + " liveQueueLimit=" + this.liveQueueLimit);
@@ -1060,6 +1081,8 @@ class BindManager {
             this.liveMode = false;
             this.liveUrl = null;
             this.liveQueueLimit = DEFAULT_LIVE_QUEUE_LIMIT;
+            this.frameSizeWarningLogged = false;
+            this.dumpedFirstFrame = false;
 
             this.ticksPerFrame = (tpf < 0) ? -1 : Math.max(1, tpf);
             this.loop = loop;
@@ -1098,6 +1121,8 @@ class BindManager {
             loop = false;
             warmupTicks = 0;
             liveQueueLimit = DEFAULT_LIVE_QUEUE_LIMIT;
+            frameSizeWarningLogged = false;
+            dumpedFirstFrame = false;
         }
 
         void resetToBlack() {
@@ -1261,7 +1286,8 @@ class BindManager {
                         }
                         File f = snap.get(idx);
                         try {
-                            byte[] linear = frameSourceLoader.readFrameLinear(f, expectedWidth(), expectedHeight(), lut);
+                            byte[] linear = frameSourceLoader.readFrameLinear(f, expectedWidth(), expectedHeight(),
+                                    lut);
                             buffer.offer(linear);
                         } catch (IOException e) {
                             plugin.getLogger().warning("preload failed: " + f.getName() + " -> " + e.getMessage());
@@ -1296,6 +1322,13 @@ class BindManager {
                 } catch (Throwable ignore) {
                 }
                 ffmpegProc = null;
+            }
+            if (progressTask != null) {
+                try {
+                    progressTask.cancel();
+                } catch (Throwable ignore) {
+                }
+                progressTask = null;
             }
         }
 
@@ -1335,8 +1368,11 @@ class BindManager {
                     int off = 0, n;
                     while (off < RGB_BYTES && (n = in.read(rgb, off, RGB_BYTES - off)) > 0)
                         off += n;
-                    if (off < RGB_BYTES)
+                    if (off < RGB_BYTES) {
+                        logFrameSizeMismatch(off, RGB_BYTES, false);
                         break;
+                    }
+                    dumpRawFrameOnce(rgb, RGB_BYTES, false);
                     byte[] linear = frameSourceLoader.rgb24ToPalette(rgb, W, H, lut);
                     buffer.offer(linear);
                 }
@@ -1356,44 +1392,78 @@ class BindManager {
             final int W = expectedWidth();
             final int H = expectedHeight();
             final int RGB_BYTES = W * H * 3;
-
             while (preloadRunning) {
                 List<String> cmd = new ArrayList<>();
+                // escalate probing after a couple attempts
+                int analyzed = (this.liveConnectAttempts >= 2) ? 1000000 : 200000;
+                int probe = (this.liveConnectAttempts >= 2) ? 1000000 : 65536;
+                double fps = (ticksPerFrame > 0) ? (20.0 / ticksPerFrame) : 0.0;
+                this.liveConnectAttempts++;
+
                 cmd.addAll(Arrays.asList(
                         "ffmpeg",
                         "-hide_banner", "-loglevel", "error", "-nostdin",
                         "-fflags", "nobuffer",
                         "-flags", "low_delay",
-                        "-analyzeduration", "1000000",
-                        "-probesize", "1000000",
+                        "-analyzeduration", String.valueOf(analyzed),
+                        "-probesize", String.valueOf(probe),
+                        "-reconnect", "1",
+                        "-reconnect_streamed", "1",
+                        "-reconnect_delay_max", "2",
                         "-i", liveUrl,
-                        "-vf", scaleFilter(W, H),
-                        "-pix_fmt", "rgb24",
-                        "-f", "rawvideo", "pipe:1"));
+                        "-vf", scaleFilterWithFps(W, H, fps),
+                        "-f", "image2pipe",
+                        "-vcodec", "ppm",
+                        "pipe:1"));
 
                 ProcessBuilder pb = new ProcessBuilder(cmd);
-                pb.redirectErrorStream(true);
+                pb.redirectErrorStream(false);
                 try {
                     ffmpegProc = pb.start();
                 } catch (IOException e) {
                     plugin.getLogger().warning(
                             "[mplay] screen " + id + " live ffmpeg launch failed: " + e.getMessage());
+                    if (liveStarter != null)
+                        sendFeedback(liveStarter, "[mplay] live: ffmpeg start failed: " + e.getMessage());
                     sleepSilently(1000);
                     continue;
                 }
 
-                try (InputStream in = new BufferedInputStream(ffmpegProc.getInputStream(), RGB_BYTES * 2)) {
-                    byte[] rgb = new byte[RGB_BYTES];
+                // drain stderr asynchronously to avoid blocking if ffmpeg logs
+                final Process procForErr = ffmpegProc;
+                Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                    try (InputStream es = procForErr.getErrorStream()) {
+                        byte[] buf = new byte[1024];
+                        while (preloadRunning && es.read(buf) != -1) {
+                            // ignore content; loglevel=error already minimizes noise
+                        }
+                    } catch (IOException ignore) {
+                    }
+                });
+
+                try (InputStream in = new BufferedInputStream(ffmpegProc.getInputStream(), 1 << 20)) {
                     while (preloadRunning) {
                         if (bufferTarget > 0 && buffer.size() >= bufferTarget) {
                             sleepSilently(5);
                             continue;
                         }
-                        int off = 0, n;
-                        while (off < RGB_BYTES && (n = in.read(rgb, off, RGB_BYTES - off)) > 0)
-                            off += n;
-                        if (off < RGB_BYTES)
+                        byte[] rgb = new byte[RGB_BYTES];
+                        if (!readOnePPMFrame(in, W, H, rgb)) {
+                            if (!firstFrameAnnounced && liveStarter != null)
+                                sendFeedback(liveStarter, "[mplay] live: waiting for first frame (reconnecting if needed)...");
                             break;
+                        }
+                        if (!firstFrameAnnounced) {
+                            firstFrameAnnounced = true;
+                            long ms = (System.nanoTime() - liveStartNano) / 1_000_000L;
+                            if (liveStarter != null)
+                                sendFeedback(liveStarter, "[mplay] live: first frame after " + ms + " ms.");
+                            if (progressTask != null) {
+                                try { progressTask.cancel(); } catch (Throwable ignore) {}
+                                progressTask = null;
+                            }
+                        }
+                        dumpRawFrameOnce(rgb, RGB_BYTES, true);
                         byte[] linear = frameSourceLoader.rgb24ToPalette(rgb, W, H, lut);
                         buffer.offer(linear);
                         if (liveMode && liveQueueLimit > 0) {
@@ -1404,6 +1474,8 @@ class BindManager {
                 } catch (IOException io) {
                     plugin.getLogger().warning(
                             "[mplay] screen " + id + " live read error: " + io.getMessage());
+                    if (liveStarter != null)
+                        sendFeedback(liveStarter, "[mplay] live error: " + io.getMessage());
                 } finally {
                     try {
                         if (ffmpegProc != null)
@@ -1419,6 +1491,83 @@ class BindManager {
             }
         }
 
+        // Minimal PPM (P6) parser: reads one frame (binary P6 with maxval 255)
+        private boolean readOnePPMFrame(InputStream in, int width, int height, byte[] out) throws IOException {
+            // find magic 'P6'
+            if (!seekMagicP6(in)) return false;
+            String wTok = readTokenSkippingComments(in);
+            String hTok = readTokenSkippingComments(in);
+            String maxTok = readTokenSkippingComments(in);
+            if (wTok == null || hTok == null || maxTok == null) return false;
+            int w, h, maxv;
+            try {
+                w = Integer.parseInt(wTok);
+                h = Integer.parseInt(hTok);
+                maxv = Integer.parseInt(maxTok);
+            } catch (NumberFormatException e) {
+                return false;
+            }
+            if (w != width || h != height || maxv != 255) {
+                // read and discard payload of this unexpected frame
+                long toSkip = (long) w * (long) h * 3L;
+                while (toSkip > 0) {
+                    long s = in.skip(toSkip);
+                    if (s <= 0) break;
+                    toSkip -= s;
+                }
+                return false;
+            }
+            // now read pixel data
+            int need = width * height * 3;
+            int off = 0;
+            while (off < need) {
+                int n = in.read(out, off, need - off);
+                if (n <= 0) break;
+                off += n;
+            }
+            return off == need;
+        }
+
+        private boolean seekMagicP6(InputStream in) throws IOException {
+            int prev = -1;
+            int c;
+            while ((c = in.read()) != -1) {
+                if (prev == 'P' && c == '6') {
+                    return true;
+                }
+                prev = c;
+            }
+            return false;
+        }
+
+        private String readTokenSkippingComments(InputStream in) throws IOException {
+            StringBuilder sb = new StringBuilder();
+            int c;
+            // skip whitespace and comments
+            while (true) {
+                in.mark(1);
+                c = in.read();
+                if (c == -1) return null;
+                if (Character.isWhitespace(c)) continue;
+                if (c == '#') {
+                    // skip until end of line
+                    while ((c = in.read()) != -1 && c != '\n') {
+                    }
+                    continue;
+                }
+                in.reset();
+                break;
+            }
+            // read token until whitespace
+            while (true) {
+                c = in.read();
+                if (c == -1) break;
+                if (Character.isWhitespace(c)) break;
+                sb.append((char) c);
+            }
+            return sb.length() == 0 ? null : sb.toString();
+        }
+
         private void sleepSilently(long millis) {
             try {
                 Thread.sleep(millis);
@@ -1428,8 +1577,88 @@ class BindManager {
 
         private String scaleFilter(int width, int height) {
             return String.format(Locale.US,
-                    "scale=%d:%d:flags=neighbor:force_original_aspect_ratio=disable,setsar=1",
+                    "scale=%d:%d:flags=neighbor:force_original_aspect_ratio=disable,setsar=1,format=rgb24",
                     width, height);
+        }
+
+        private String scaleFilterWithFps(int width, int height, double fps) {
+            String base = scaleFilter(width, height);
+            if (fps > 0.0) {
+                base += String.format(Locale.US, ",fps=%.3f", fps);
+            }
+            return base;
+        }
+
+        private void logFrameSizeMismatch(int actual, int expected, boolean live) {
+            if (frameSizeWarningLogged)
+                return;
+            frameSizeWarningLogged = true;
+            plugin.getLogger().warning(String.format(Locale.US,
+                    "[mplay] screen %d %s frame truncated: read=%d expected=%d. Subsequent frames may wrap."
+                            + " Enable more buffer or inspect network stability.",
+                    id,
+                    live ? "live" : "video",
+                    actual,
+                    expected));
+        }
+
+        private void dumpRawFrameOnce(byte[] rgb, int length, boolean live) {
+            if (dumpedFirstFrame)
+                return;
+            dumpedFirstFrame = true;
+            try {
+                File debugDir = new File(plugin.getDataFolder(), "debug");
+                if (!debugDir.exists() && !debugDir.mkdirs())
+                    throw new IOException("failed to create debug directory: " + debugDir.getAbsolutePath());
+                String suffix = live ? "-live" : "-video";
+                File out = new File(debugDir,
+                        String.format(Locale.US, "screen-%d%s-first.rgb", id, suffix));
+                try (FileOutputStream fos = new FileOutputStream(out)) {
+                    fos.write(Arrays.copyOf(rgb, length));
+                }
+                plugin.getLogger().info("[mplay] dumped raw frame to " + out.getAbsolutePath());
+            } catch (IOException e) {
+                plugin.getLogger().warning("[mplay] failed to dump raw frame for screen " + id + ": " + e.getMessage());
+            }
+        }
+
+        private void startProgressNotifier() {
+            if (liveStarter == null) return;
+            if (progressTask != null) {
+                try { progressTask.cancel(); } catch (Throwable ignore) {}
+            }
+            progressTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+                if (!liveMode || !preloadRunning) {
+                    try { progressTask.cancel(); } catch (Throwable ignore) {}
+                    progressTask = null;
+                    return;
+                }
+                if (firstFrameAnnounced) {
+                    try { progressTask.cancel(); } catch (Throwable ignore) {}
+                    progressTask = null;
+                    return;
+                }
+                long ms = (System.nanoTime() - liveStartNano) / 1_000_000L;
+                sendFeedback(liveStarter, "[mplay] live: connecting... " + (ms/1000.0) + "s elapsed");
+            }, 40L, 60L); // start after 2s, repeat ~3s
+        }
+
+        private void dumpImageFrameOnce(BufferedImage img, boolean live) {
+            if (dumpedFirstFrame)
+                return;
+            dumpedFirstFrame = true;
+            try {
+                File debugDir = new File(plugin.getDataFolder(), "debug");
+                if (!debugDir.exists() && !debugDir.mkdirs())
+                    throw new IOException("failed to create debug directory: " + debugDir.getAbsolutePath());
+                String suffix = live ? "-live" : "-video";
+                File out = new File(debugDir,
+                        String.format(Locale.US, "screen-%d%s-first.png", id, suffix));
+                ImageIO.write(img, "png", out);
+                plugin.getLogger().info("[mplay] dumped png frame to " + out.getAbsolutePath());
+            } catch (IOException e) {
+                plugin.getLogger().warning("[mplay] failed to dump png frame for screen " + id + ": " + e.getMessage());
+            }
         }
 
         private boolean hasAnyPending() {
@@ -1437,6 +1666,48 @@ class BindManager {
                 if (b.hasPendingFrame)
                     return true;
             return false;
+        }
+
+        private BufferedImage ensureRGBImage(BufferedImage src, int width, int height) {
+            BufferedImage current = src;
+            if (src.getWidth() != width || src.getHeight() != height) {
+                BufferedImage scaled = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+                Graphics2D g = scaled.createGraphics();
+                try {
+                    g.drawImage(src, 0, 0, width, height, null);
+                } finally {
+                    g.dispose();
+                }
+                current = scaled;
+            } else if (src.getType() != BufferedImage.TYPE_INT_RGB) {
+                BufferedImage converted = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+                Graphics2D g = converted.createGraphics();
+                try {
+                    g.drawImage(src, 0, 0, null);
+                } finally {
+                    g.dispose();
+                }
+                current = converted;
+            }
+            return current;
+        }
+
+        private byte[] bufferedImageToPalette(BufferedImage img, byte[] lut) {
+            int width = img.getWidth();
+            int height = img.getHeight();
+            int[] argb = img.getRGB(0, 0, width, height, null, 0, width);
+            byte[] rgb = new byte[argb.length * 3];
+            int idx = 0;
+            for (int pixel : argb) {
+                rgb[idx++] = (byte) ((pixel >> 16) & 0xFF);
+                rgb[idx++] = (byte) ((pixel >> 8) & 0xFF);
+                rgb[idx++] = (byte) (pixel & 0xFF);
+            }
+            try {
+                return frameSourceLoader.rgb24ToPalette(rgb, width, height, lut);
+            } catch (IOException e) {
+                throw new RuntimeException("rgb24ToPalette failed", e);
+            }
         }
 
         private boolean inRange(Player p) {
