@@ -48,6 +48,14 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
 
     @Override
     public void onEnable() {
+        // Ensure config defaults exist
+        try {
+            getConfig().addDefault("debug", false);
+            getConfig().options().copyDefaults(true);
+            saveConfig();
+        } catch (Throwable ignore) {
+        }
+
         getCommand("mplay").setExecutor(this);
         getLogger().info("MapFramePlayer enabled.");
 
@@ -194,9 +202,19 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     boolean loop = (idx < a.length) ? Boolean.parseBoolean(a[idx++]) : false;
                     int warmup = (idx < a.length) ? Integer.parseInt(a[idx++]) : 0;
 
+                    if (!binds.isLutLoaded()) {
+                        s.sendMessage(color("&cLUT 未加载：请将 colormap.lut 放到 plugins/MapFramePlayer/ 下，再重试。"));
+                        return true;
+                    }
+
                     int loaded = binds.loadFramesFromFolder(screenId, folder);
                     if (loaded <= 0) {
                         s.sendMessage(color("&cNo frames loaded for screen #" + screenId + ". Check folder & size."));
+                        return true;
+                    }
+                    // 若为视频模式，需要 ffmpeg
+                    if (binds.willUseFfmpeg(screenId) && !binds.isFfmpegAvailable()) {
+                        s.sendMessage(color("&c未检测到 ffmpeg，请确认已安装并加入 PATH。"));
                         return true;
                     }
                     binds.startPlayback(screenId, tpf, loop, 0, warmup);
@@ -249,26 +267,94 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         s.sendMessage(color("&f" + line));
                     return true;
                 }
-                case "download": {
-                    if (a.length < 3) {
-                        s.sendMessage(color("&f/mplay download <name> <url>"));
+                case "media": {
+                    if (a.length == 1) {
+                        s.sendMessage(color("&eMedia 子命令:"));
+                        s.sendMessage(color("&f/mplay media list"));
+                        s.sendMessage(color("&f/mplay media download <name> <url>"));
+                        s.sendMessage(color("&f/mplay media delete <name>"));
+                        s.sendMessage(color("&f/mplay media rename <old> <new>"));
+                        s.sendMessage(color("&f/mplay media cancel"));
+                        s.sendMessage(color("&f/mplay media transcode <name> [fps] [quality]"));
                         return true;
                     }
-                    String name = a[1];
-                    String url = a[2];
-                    binds.downloadMedia(name, url, s);
-                    return true;
-                }
-                case "media": {
-                    List<String> entries = binds.listMediaEntries();
-                    if (entries.isEmpty()) {
-                        s.sendMessage(color("&7No media found under frames/"));
-                    } else {
-                        s.sendMessage(color("&eAvailable media:"));
-                        for (String entry : entries)
-                            s.sendMessage(color("&f" + entry));
+                    String sub2 = a[1].toLowerCase(Locale.ROOT);
+                    switch (sub2) {
+                        case "help": {
+                            s.sendMessage(color("&eMedia 子命令:"));
+                            s.sendMessage(color("&f/mplay media list"));
+                            s.sendMessage(color("&f/mplay media download <name> <url>"));
+                            s.sendMessage(color("&f/mplay media delete <name>"));
+                            s.sendMessage(color("&f/mplay media rename <old> <new>"));
+                            s.sendMessage(color("&f/mplay media cancel"));
+                            s.sendMessage(color("&f/mplay media transcode <name> [fps] [quality]"));
+                            return true;
+                        }
+                        case "list": {
+                            List<String> entries = binds.listMediaEntries();
+                            if (entries.isEmpty()) {
+                                s.sendMessage(color("&7No media found under frames/"));
+                            } else {
+                                s.sendMessage(color("&eAvailable media:"));
+                                for (String entry : entries)
+                                    s.sendMessage(color("&f" + entry));
+                            }
+                            return true;
+                        }
+                        case "download": {
+                            if (a.length < 4) {
+                                s.sendMessage(color("&f/mplay media download <name> <url>"));
+                                return true;
+                            }
+                            String name = a[2];
+                            String url = a[3];
+                            binds.downloadMedia(name, url, s);
+                            return true;
+                        }
+                        case "delete": {
+                            if (a.length < 3) {
+                                s.sendMessage(color("&f/mplay media delete <name>"));
+                                return true;
+                            }
+                            binds.deleteMedia(a[2], s);
+                            return true;
+                        }
+                        case "rename": {
+                            if (a.length < 4) {
+                                s.sendMessage(color("&f/mplay media rename <old> <new>"));
+                                return true;
+                            }
+                            binds.renameMedia(a[2], a[3], s);
+                            return true;
+                        }
+                        case "transcode": {
+                            if (a.length < 3) {
+                                s.sendMessage(color("&f/mplay media transcode <name> [fps] [quality]"));
+                                s.sendMessage(color("&7quality 示例: 480p / 720p / 1080p 或 1280x720；不放大小于目标的视频"));
+                                return true;
+                            }
+                            String name = a[2];
+                            Integer fps = null;
+                            Integer height = null;
+                            int idx = 3;
+                            if (idx < a.length && isNumeric(a[idx])) {
+                                fps = Integer.parseInt(a[idx++]);
+                            }
+                            if (idx < a.length) {
+                                height = parseQualityHeight(a[idx]);
+                            }
+                            binds.transcodeMedia(name, fps, height, s);
+                            return true;
+                        }
+                        case "cancel": {
+                            binds.cancelCurrentMediaOperation(s);
+                            return true;
+                        }
+                        default: {
+                            s.sendMessage(color("&7未知子命令，使用 &f/mplay media&7 查看帮助"));
+                            return true;
+                        }
                     }
-                    return true;
                 }
                 case "live": {
                     TargetParseResult target = parseOptionalScreenId(a, 1);
@@ -290,6 +376,15 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                         tpf = Integer.parseInt(a[idx++]);
                     if (idx < a.length)
                         bufferFrames = Integer.parseInt(a[idx++]);
+
+                    if (!binds.isLutLoaded()) {
+                        s.sendMessage(color("&cLUT 未加载：请将 colormap.lut 放到 plugins/MapFramePlayer/ 下，再重试。"));
+                        return true;
+                    }
+                    if (!binds.isFfmpegAvailable()) {
+                        s.sendMessage(color("&c未检测到 ffmpeg，请确认已安装并加入 PATH。"));
+                        return true;
+                    }
                     binds.startLiveStream(screenId, source, tpf != null ? tpf : 0,
                             bufferFrames, s);
                     return true;
@@ -302,6 +397,20 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
                     String name = a[1];
                     String roomId = a[2];
                     binds.fetchBilibiliStream(name, roomId, s);
+                    return true;
+                }
+                case "debug": {
+                    if (a.length < 2) {
+                        s.sendMessage(color("&f/mplay debug <true|false>"));
+                        return true;
+                    }
+                    boolean val = Boolean.parseBoolean(a[1]);
+                    try {
+                        getConfig().set("debug", val);
+                        saveConfig();
+                    } catch (Throwable ignore) {}
+                    binds.setDebug(val);
+                    s.sendMessage(color("&aDebug 已设置为: " + val));
                     return true;
                 }
                 case "clear": {
@@ -352,22 +461,33 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
 
     private void help(CommandSender s) {
         s.sendMessage(color("&eUsage:"));
-        s.sendMessage(color("&f/mplay create <cols> <rows> [radius] [x y z]"));
-        s.sendMessage(color("&f/mplay set <id1,id2,...> <world> <cols> <rows> [radius]"));
-        s.sendMessage(color("&f/mplay list"));
+        // 屏幕管理
+        s.sendMessage(color("&f/mplay create <cols> <rows> [radius] [x y z] &7# 创建新屏幕"));
+        s.sendMessage(color("&f/mplay set <id1,id2,...> <world> <cols> <rows> [radius] &7# 绑定现有地图"));
+        s.sendMessage(color("&f/mplay list &7# 列出所有屏幕"));
+        s.sendMessage(color("&f/mplay status [id <screenId>|all] &7# 查看状态"));
+        s.sendMessage(color("&f/mplay clear [id <screenId>|all] &7# 清理并注销屏幕"));
+        s.sendMessage(color("&f/mplay reset [id <screenId>] &7# 重置为黑屏"));
+
+        // 播放控制
         s.sendMessage(color("&f/mplay play [id <screenId>] <folder> [tpf] [loop] [warmupTicks]"));
-        s.sendMessage(color("&7warmupTicks: 开播前延迟的 tick 数（20 tick = 1 秒）"));
+        s.sendMessage(color("&7tpf: -1=定格, 0=源驱动, >0=固定节奏(20/tpf fps); warmupTicks: 启播延迟"));
         s.sendMessage(color("&f/mplay stop [id <screenId>|all]"));
-        s.sendMessage(color("&f/mplay status [id <screenId>|all]"));
-        s.sendMessage(color("&f/mplay clear [id <screenId>|all]"));
-        s.sendMessage(color("&f/mplay reset [id <screenId>]"));
-        s.sendMessage(color("&f/mplay download <name> <url>"));
-        s.sendMessage(color("&f/mplay bilibili <name> <roomId>"));
+
+        // 媒体管理
+        s.sendMessage(color("&f/mplay media list"));
+        s.sendMessage(color("&f/mplay media download <name> <url>"));
+        s.sendMessage(color("&f/mplay media delete <name>"));
+        s.sendMessage(color("&f/mplay media rename <old> <new>"));
+
+        // 直播与扩展
+        s.sendMessage(color("&f/mplay bilibili <name> <roomId> &7# 解析并保存 m3u8"));
+        s.sendMessage(color("&f/mplay live [id <screenId>] <m3u8OrName> [ticksPerFrame] [bufferFrames]"));
+        s.sendMessage(color("&f/mplay debug <true|false>"));
+
+        // 素材类型
         s.sendMessage(color(
-                "&f/mplay live [id <screenId>] <m3u8OrName> [ticksPerFrame] [bufferFrames]"));
-        s.sendMessage(color("&f/mplay media"));
-        s.sendMessage(color(
-                "&7Frames: .json (HxW int), .smrf (raw W*H bytes), .png/.jpg (RGB via LUT), or a single video file (ffmpeg)."));
+                "&7Frames: .json (HxW int), .smrf (raw W*H bytes), .png/.jpg (RGB via LUT), video file (ffmpeg)."));
 
     }
 
@@ -402,6 +522,21 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
         } catch (NumberFormatException ignore) {
             return false;
         }
+    }
+
+    private Integer parseQualityHeight(String token) {
+        if (token == null) return null;
+        String t = token.trim().toLowerCase(Locale.ROOT);
+        // forms: 720p, 720, 1280x720, 720px
+        if (t.endsWith("px")) t = t.substring(0, t.length() - 2);
+        if (t.endsWith("p")) t = t.substring(0, t.length() - 1);
+        int x = t.indexOf('x');
+        if (x > 0) {
+            String h = t.substring(x + 1);
+            try { return Integer.parseInt(h); } catch (NumberFormatException ignore) {}
+        }
+        try { return Integer.parseInt(t); } catch (NumberFormatException ignore) {}
+        return null;
     }
 
     private static class TargetParseResult {
