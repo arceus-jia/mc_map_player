@@ -57,9 +57,10 @@ class BindManager {
     private final Map<Integer, ScreenSession> sessions = new LinkedHashMap<>();
     private int nextScreenId = 1;
     private Integer lastActiveId = null;
+    private final List<ScreenSession> pendingAutoResume = new ArrayList<>();
 
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    private final Type persistedListType = new TypeToken<List<PersistedScreen>>() {
+    private final Type persistedListType = new TypeToken<List<ScreenStore.PersistedScreen>>() {
     }.getType();
 
     private byte[] lut = null;
@@ -92,7 +93,8 @@ class BindManager {
                 if (!restorePersistedScreen(screen))
                     dirty = true;
             }
-            
+            schedulePendingAutoResume();
+
             if (dirty)
                 saveSessions();
         } catch (IOException | RuntimeException e) {
@@ -267,8 +269,7 @@ class BindManager {
 
     void stop() {
         for (ScreenSession session : new ArrayList<>(sessions.values())) {
-            session.stopPlayback();
-            session.stopPreloader();
+            session.stopPlayback(false);
         }
         saveSessions();
         sessions.clear();
@@ -418,25 +419,27 @@ class BindManager {
             return;
         lastActiveId = screenId;
         session.startPlayback(tpf, loop, bufferTarget, warmupTicks);
+        saveSessions();
     }
 
     boolean stopPlayback(int screenId) {
         ScreenSession session = sessions.get(screenId);
         if (session == null)
             return false;
-        session.stopPlayback();
-        session.stopPreloader();
+        session.stopPlayback(false);
         lastActiveId = screenId;
+        saveSessions();
         return true;
     }
 
     int stopAllPlayback() {
         int count = 0;
         for (ScreenSession session : sessions.values()) {
-            session.stopPlayback();
-            session.stopPreloader();
+            session.stopPlayback(false);
             count++;
         }
+        if (count > 0)
+            saveSessions();
         return count;
     }
 
@@ -494,6 +497,22 @@ class BindManager {
 
     boolean hasScreens() {
         return !sessions.isEmpty();
+    }
+
+    void refreshViewer(Player player) {
+        if (player == null)
+            return;
+        for (ScreenSession session : sessions.values()) {
+            session.refreshViewer(player);
+        }
+    }
+
+    void forgetViewer(UUID playerId) {
+        if (playerId == null)
+            return;
+        for (ScreenSession session : sessions.values()) {
+            session.forgetViewer(playerId);
+        }
     }
 
     private ScreenSession registerSession(BindingGroup group) {
@@ -558,6 +577,22 @@ class BindManager {
         }
     }
 
+    private void schedulePendingAutoResume() {
+        if (pendingAutoResume.isEmpty())
+            return;
+        List<ScreenSession> toResume = new ArrayList<>(pendingAutoResume);
+        pendingAutoResume.clear();
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            for (ScreenSession session : toResume) {
+                try {
+                    session.resumeFromPersist();
+                } catch (RuntimeException ex) {
+                    plugin.getLogger().warning("[mplay] resume failed for screen #" + session.id + ": " + ex.getMessage());
+                }
+            }
+        });
+    }
+
     private ScreenStore.PersistedScreen toPersistedScreen(ScreenSession session) {
         BindingGroup g = session.group;
         ScreenStore.PersistedScreen ps = new ScreenStore.PersistedScreen();
@@ -594,6 +629,25 @@ class BindManager {
         }
         ps.sourceLabel = session.sourceLabel;
         ps.video = session.videoMode;
+        if (session.resumeState.enabled) {
+            ps.resumeEnabled = true;
+            ps.resumeMode = session.resumeState.mode;
+            ps.resumeFolder = session.resumeState.folder;
+            ps.resumeTicksPerFrame = session.resumeState.ticksPerFrame;
+            ps.resumeLoop = session.resumeState.loop;
+            ps.resumeWarmupTicks = session.resumeState.warmupTicks;
+            ps.resumeLiveSource = session.resumeState.liveSource;
+            ps.resumeBufferFrames = session.resumeState.bufferFrames;
+        } else {
+            ps.resumeEnabled = false;
+            ps.resumeMode = null;
+            ps.resumeFolder = null;
+            ps.resumeTicksPerFrame = null;
+            ps.resumeLoop = null;
+            ps.resumeWarmupTicks = null;
+            ps.resumeLiveSource = null;
+            ps.resumeBufferFrames = null;
+        }
         return ps;
     }
 
@@ -656,6 +710,7 @@ class BindManager {
         ScreenSession session = registerSessionInternal(group, ps.id, false);
         session.sourceLabel = ps.sourceLabel != null ? ps.sourceLabel : "";
         session.initBlackFrame();
+        session.restoreResume(ps);
         return true;
     }
 
@@ -671,39 +726,12 @@ class BindManager {
         return session;
     }
 
-    private static class PersistedScreen {
-        int id;
-        String world;
-        int cols;
-        int rows;
-        int radius;
-        Double centerX;
-        Double centerY;
-        Double centerZ;
-        List<Integer> mapIds;
-        List<BlockPos> barriers;
-        List<Vec3> frames;
-        String sourceLabel;
-        boolean video;
-    }
-
-    private static class BlockPos {
-        int x;
-        int y;
-        int z;
-    }
-
-    private static class Vec3 {
-        double x;
-        double y;
-        double z;
-    }
-
     private class ScreenSession {
         final int id;
         final BindingGroup group;
         final int maxDistance;
         private static final int DEFAULT_LIVE_QUEUE_LIMIT = 30;
+        private static final int MAX_BUFFER_FRAMES = 240;
         private String sourceLabel = "";
 
         private final ConcurrentLinkedQueue<byte[]> buffer = new ConcurrentLinkedQueue<>();
@@ -734,6 +762,9 @@ class BindManager {
         private long startTick = 0L;
         private long nextFrameTick = Long.MAX_VALUE;
         private int warmupTicks = 0;
+
+        private String lastFrameFolder = null;
+        private final ResumeState resumeState = new ResumeState();
 
         private ScreenSession(int id, BindingGroup group) {
             this.id = id;
@@ -814,7 +845,7 @@ class BindManager {
                                 if (loop) {
                                     frameIndex = 0;
                                 } else {
-                                    stopPlayback();
+                                    stopPlayback(true);
                                 }
                             }
                         }
@@ -881,6 +912,7 @@ class BindManager {
                 this.frames = result.frameFiles;
                 this.frameIndex = 0;
                 this.sourceLabel = result.sourceLabel != null ? result.sourceLabel : folderPath;
+                this.lastFrameFolder = folderPath;
                 saveSessions();
                 return result.frameCount;
             } catch (IOException e) {
@@ -907,7 +939,7 @@ class BindManager {
             this.loop = true; // keep ffmpeg reconnecting
             this.bufferTarget = 0;
             this.warmupTicks = 0;
-            this.liveQueueLimit = (bufferFrames > 0) ? bufferFrames : DEFAULT_LIVE_QUEUE_LIMIT;
+            this.liveQueueLimit = clampLiveQueue(bufferFrames);
             this.frameSizeWarningLogged = false;
             this.dumpedFirstFrame = false;
             this.liveStarter = starter;
@@ -929,6 +961,7 @@ class BindManager {
 
             startProgressNotifier();
             startPreloaderAsync();
+            resumeState.rememberLive(url, this.ticksPerFrame, this.liveQueueLimit);
             dbg("screen " + id + " startLiveStream url=" + url + " tpf=" + this.ticksPerFrame
                     + " liveQueueLimit=" + this.liveQueueLimit);
         }
@@ -947,7 +980,7 @@ class BindManager {
 
             this.ticksPerFrame = (tpf < 0) ? -1 : Math.max(1, tpf);
             this.loop = loop;
-            this.bufferTarget = 0;
+            this.bufferTarget = clampPlaybackBuffer(bufferTarget);
             this.warmupTicks = Math.max(0, warmupTicks);
 
             this.startTick = MapFramePlayer.TICK;
@@ -957,6 +990,7 @@ class BindManager {
 
             buffer.clear();
             startPreloaderAsync();
+            resumeState.rememberFrames(lastFrameFolder, this.ticksPerFrame, this.loop, this.warmupTicks, this.bufferTarget);
             dbg("screen " + id + " startPlayback frames=" + frames.size()
                     + " video=" + videoMode
                     + " live=" + liveMode
@@ -965,7 +999,7 @@ class BindManager {
                     + " warmupTicks=" + this.warmupTicks);
         }
 
-        void stopPlayback() {
+        void stopPlayback(boolean clearResume) {
             stopPreloader();
             buffer.clear();
 
@@ -984,16 +1018,17 @@ class BindManager {
             liveQueueLimit = DEFAULT_LIVE_QUEUE_LIMIT;
             frameSizeWarningLogged = false;
             dumpedFirstFrame = false;
+            if (clearResume)
+                resumeState.clear();
         }
 
         void resetToBlack() {
-            stopPlayback();
+            stopPlayback(true);
             initBlackFrame();
         }
 
         void clearScreen() {
-            stopPlayback();
-            stopPreloader();
+            stopPlayback(true);
 
             World w = Bukkit.getWorld(group.worldName);
             if (w != null) {
@@ -1040,6 +1075,8 @@ class BindManager {
             group.placedBarriers.clear();
 
             group.members.clear();
+            resumeState.clear();
+            lastFrameFolder = null;
         }
 
         String describe() {
@@ -1129,11 +1166,8 @@ class BindManager {
                 try {
                     int idx = frameIndex;
                     while (preloadRunning) {
-                        if (bufferTarget > 0 && buffer.size() >= bufferTarget) {
-                            try {
-                                Thread.sleep(5);
-                            } catch (InterruptedException ignored) {
-                            }
+                        if (buffer.size() >= effectiveBufferTarget()) {
+                            sleepSilently(5);
                             continue;
                         }
                         List<File> snap = this.frames;
@@ -1219,11 +1253,8 @@ class BindManager {
             try (InputStream in = new BufferedInputStream(ffmpegProc.getInputStream(), RGB_BYTES * 2)) {
                 byte[] rgb = new byte[RGB_BYTES];
                 while (preloadRunning) {
-                    if (bufferTarget > 0 && buffer.size() >= bufferTarget) {
-                        try {
-                            Thread.sleep(5);
-                        } catch (InterruptedException ignored) {
-                        }
+                    if (buffer.size() >= effectiveBufferTarget()) {
+                        sleepSilently(5);
                         continue;
                     }
                     int off = 0, n;
@@ -1304,7 +1335,7 @@ class BindManager {
 
                 try (InputStream in = new BufferedInputStream(ffmpegProc.getInputStream(), 1 << 20)) {
                     while (preloadRunning) {
-                        if (bufferTarget > 0 && buffer.size() >= bufferTarget) {
+                        if (buffer.size() >= effectiveBufferTarget()) {
                             sleepSilently(5);
                             continue;
                         }
@@ -1454,6 +1485,157 @@ class BindManager {
             return false;
         }
 
+        void restoreResume(ScreenStore.PersistedScreen ps) {
+            resumeState.clear();
+            if (ps.resumeEnabled == null || !ps.resumeEnabled)
+                return;
+
+            String mode = ps.resumeMode != null ? ps.resumeMode.trim().toLowerCase(Locale.ROOT) : "";
+            if ("live".equals(mode)) {
+                if (isBlank(ps.resumeLiveSource)) {
+                    plugin.getLogger().warning("[mplay] skip live resume for screen " + id + ": missing url");
+                    return;
+                }
+                resumeState.enabled = true;
+                resumeState.mode = "live";
+                resumeState.folder = null;
+                resumeState.liveSource = ps.resumeLiveSource;
+                resumeState.ticksPerFrame = ps.resumeTicksPerFrame != null ? ps.resumeTicksPerFrame : 0;
+                resumeState.loop = true;
+                resumeState.warmupTicks = 0;
+                resumeState.bufferFrames = clampLiveQueue(ps.resumeBufferFrames != null ? ps.resumeBufferFrames : DEFAULT_LIVE_QUEUE_LIMIT);
+                queueAutoResume();
+                return;
+            }
+
+            // default to frames mode when folder exists
+            if (!isBlank(ps.resumeFolder)) {
+                resumeState.enabled = true;
+                resumeState.mode = "frames";
+                resumeState.folder = ps.resumeFolder;
+                lastFrameFolder = ps.resumeFolder;
+                resumeState.liveSource = null;
+                resumeState.ticksPerFrame = ps.resumeTicksPerFrame != null ? ps.resumeTicksPerFrame : 1;
+                resumeState.loop = ps.resumeLoop != null ? ps.resumeLoop : false;
+                resumeState.warmupTicks = ps.resumeWarmupTicks != null ? ps.resumeWarmupTicks : 0;
+                resumeState.bufferFrames = clampPlaybackBuffer(ps.resumeBufferFrames != null ? ps.resumeBufferFrames : 0);
+                queueAutoResume();
+            }
+        }
+
+        void resumeFromPersist() {
+            if (!resumeState.enabled)
+                return;
+
+            if ("live".equals(resumeState.mode)) {
+                if (isBlank(resumeState.liveSource)) {
+                    resumeState.enabled = false;
+                    return;
+                }
+                String label = !isBlank(sourceLabel) ? sourceLabel : resumeState.liveSource;
+                startLiveStream(resumeState.liveSource, label,
+                        resumeState.ticksPerFrame,
+                        resumeState.bufferFrames,
+                        null);
+                saveSessions();
+                plugin.getLogger().info("[mplay] auto-resume live for screen #" + id);
+                return;
+            }
+
+            if (!isBlank(resumeState.folder)) {
+                int loaded = loadFramesFromFolder(resumeState.folder);
+                if (loaded <= 0) {
+                    resumeState.enabled = false;
+                    saveSessions();
+                    plugin.getLogger().warning("[mplay] auto-resume skipped for screen #" + id + ": frames folder missing");
+                    return;
+                }
+                startPlayback(resumeState.ticksPerFrame, resumeState.loop,
+                        resumeState.bufferFrames,
+                        resumeState.warmupTicks);
+                saveSessions();
+                plugin.getLogger().info("[mplay] auto-resume frames for screen #" + id + " from " + resumeState.folder);
+            }
+        }
+
+        private void queueAutoResume() {
+            if (!pendingAutoResume.contains(this))
+                pendingAutoResume.add(this);
+        }
+
+        private int clampPlaybackBuffer(int candidate) {
+            if (candidate <= 0)
+                return 0;
+            return Math.min(candidate, MAX_BUFFER_FRAMES);
+        }
+
+        private int clampLiveQueue(int requested) {
+            int base = (requested > 0) ? requested : DEFAULT_LIVE_QUEUE_LIMIT;
+            base = Math.max(1, base);
+            return Math.min(base, MAX_BUFFER_FRAMES);
+        }
+
+        private int effectiveBufferTarget() {
+            int limit = bufferTarget > 0 ? bufferTarget : MAX_BUFFER_FRAMES;
+            return Math.max(1, Math.min(limit, MAX_BUFFER_FRAMES));
+        }
+
+        private boolean isBlank(String s) {
+            return s == null || s.trim().isEmpty();
+        }
+
+        private final class ResumeState {
+            private boolean enabled = false;
+            private String mode = "";
+            private String folder = null;
+            private String liveSource = null;
+            private int ticksPerFrame = 1;
+            private boolean loop = false;
+            private int warmupTicks = 0;
+            private int bufferFrames = 0;
+
+            void rememberFrames(String folder, int tpf, boolean looping, int warmup, int bufferTarget) {
+                if (isBlank(folder)) {
+                    clear();
+                    return;
+                }
+                enabled = true;
+                mode = "frames";
+                this.folder = folder;
+                this.liveSource = null;
+                this.ticksPerFrame = tpf;
+                this.loop = looping;
+                this.warmupTicks = warmup;
+                this.bufferFrames = clampPlaybackBuffer(bufferTarget);
+            }
+
+            void rememberLive(String source, int tpf, int queueLimit) {
+                if (isBlank(source)) {
+                    clear();
+                    return;
+                }
+                enabled = true;
+                mode = "live";
+                this.liveSource = source;
+                this.folder = null;
+                this.ticksPerFrame = tpf;
+                this.loop = true;
+                this.warmupTicks = 0;
+                this.bufferFrames = clampLiveQueue(queueLimit);
+            }
+
+            void clear() {
+                enabled = false;
+                mode = "";
+                folder = null;
+                liveSource = null;
+                ticksPerFrame = 1;
+                loop = false;
+                warmupTicks = 0;
+                bufferFrames = 0;
+            }
+        }
+
         private BufferedImage ensureRGBImage(BufferedImage src, int width, int height) {
             BufferedImage current = src;
             if (src.getWidth() != width || src.getHeight() != height) {
@@ -1521,6 +1703,31 @@ class BindManager {
 
         private int expectedBytes() {
             return expectedWidth() * expectedHeight();
+        }
+
+        void refreshViewer(Player player) {
+            if (player == null)
+                return;
+            if (group.members.isEmpty())
+                return;
+            if (!inRange(player))
+                return;
+
+            UUID uuid = player.getUniqueId();
+            for (Binding binding : group.members) {
+                binding.renderer.dropSeen(uuid);
+                player.sendMap(binding.view);
+            }
+        }
+
+        void forgetViewer(UUID playerId) {
+            if (playerId == null)
+                return;
+            if (group.members.isEmpty())
+                return;
+            for (Binding binding : group.members) {
+                binding.renderer.dropSeen(playerId);
+            }
         }
 
         private byte[] sliceTile(byte[] src, int bigW, int tileRow, int tileCol, boolean flipX) {

@@ -7,6 +7,13 @@ import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.Bukkit;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -69,12 +76,37 @@ public class MapFramePlayer extends JavaPlugin implements CommandExecutor {
 
         binds.ensureTicker();
         binds.loadPersistedScreens();
+
+        getServer().getPluginManager().registerEvents(new PlayerEvents(), this);
     }
 
     @Override
     public void onDisable() {
         binds.stop();
         getLogger().info("MapFramePlayer disabled.");
+    }
+
+    private final class PlayerEvents implements Listener {
+        @EventHandler
+        public void handleJoin(PlayerJoinEvent event) {
+            binds.refreshViewer(event.getPlayer());
+        }
+
+        @EventHandler
+        public void handleRespawn(PlayerRespawnEvent event) {
+            Player player = event.getPlayer();
+            Bukkit.getScheduler().runTask(MapFramePlayer.this, () -> binds.refreshViewer(player));
+        }
+
+        @EventHandler
+        public void handleWorldChange(PlayerChangedWorldEvent event) {
+            binds.refreshViewer(event.getPlayer());
+        }
+
+        @EventHandler
+        public void handleQuit(PlayerQuitEvent event) {
+            binds.forgetViewer(event.getPlayer().getUniqueId());
+        }
     }
 
     // ====== Commands ======

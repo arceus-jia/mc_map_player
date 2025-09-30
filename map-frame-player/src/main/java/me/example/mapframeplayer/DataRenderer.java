@@ -64,6 +64,11 @@ class DataRenderer extends MapRenderer {
         seen.clear();
     }
 
+    synchronized void dropSeen(UUID playerId) {
+        if (playerId != null)
+            seen.remove(playerId);
+    }
+
     @Override
     public void render(MapView map, MapCanvas canvas, Player player) {
         // —— 距离拦截：不在范围内就直接 return，不要更新 seen ——

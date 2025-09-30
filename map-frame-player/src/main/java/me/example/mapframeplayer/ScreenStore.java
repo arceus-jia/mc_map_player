@@ -41,6 +41,14 @@ class ScreenStore {
         List<Vec3> frames;
         String sourceLabel;
         boolean video;
+        Boolean resumeEnabled;
+        String resumeMode;
+        String resumeFolder;
+        Integer resumeTicksPerFrame;
+        Boolean resumeLoop;
+        Integer resumeWarmupTicks;
+        String resumeLiveSource;
+        Integer resumeBufferFrames;
     }
 
     static class BlockPos {
@@ -54,5 +62,5 @@ class ScreenStore {
         double y;
         double z;
     }
-}
 
+}
